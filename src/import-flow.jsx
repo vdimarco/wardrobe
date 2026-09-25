@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowCounterClockwise, Check, Plus, SpinnerGap, Trash, UploadSimple, WarningCircle, X } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, Check, GooglePhotosLogo, Plus, SpinnerGap, Trash, UploadSimple, WarningCircle, X } from "@phosphor-icons/react";
 import "./import-flow.css";
 
 const API = "/api/import/jobs";
 const CONFIG_API = "/api/import/config";
+const GOOGLE_API = "/api/import/google-photos";
 const PARTS = [
   ["upperbody", "Tops"],
   ["wholebody_up", "Jackets"],
@@ -28,6 +29,22 @@ async function api(path, options) {
   const value = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(value.error || "The import job could not be updated.");
   return value;
+}
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Resolves when the OAuth callback page in the popup reports back.
+function waitForGoogleConnection(popup) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { window.removeEventListener("message", onMessage); clearInterval(closedTimer); };
+    const onMessage = (event) => {
+      if (event.origin !== window.location.origin || event.data?.type !== "wardrobe:google-photos") return;
+      cleanup();
+      if (event.data.ok) resolve(); else reject(new Error(event.data.message || "Google Photos was not connected."));
+    };
+    const closedTimer = setInterval(() => { if (popup.closed) { cleanup(); reject(new Error("Google sign-in was closed before it finished.")); } }, 500);
+    window.addEventListener("message", onMessage);
+  });
 }
 
 function deriveStatus(job) {
@@ -146,9 +163,13 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState(null);
   const [setup, setSetup] = useState(null);
+  const [googlePhotos, setGooglePhotos] = useState(null);
+  const [googleStep, setGoogleStep] = useState("");
+  const [albumLink, setAlbumLink] = useState("");
 
   useEffect(() => {
     api(CONFIG_API).then(setSetup).catch((requestError) => setSetup({ ready: false, error: requestError.message }));
+    api(`${GOOGLE_API}/status`).then(setGooglePhotos).catch(() => setGooglePhotos(null));
     api(API)
       .then((storedJobs) => {
         const visibleJobs = storedJobs.filter((job) => job.status !== "complete" && job.stages?.crop?.status !== "rejected" && job.stages?.garment?.status !== "rejected" && job.stages?.modeled?.status !== "rejected");
@@ -192,6 +213,80 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
       } catch (requestError) { setError(requestError.message); }
     }
   }, [setup]);
+
+  const addGoogleResult = useCallback((result) => {
+    const createdJobs = result.jobs || [];
+    setJobs((currentJobs) => [...currentJobs, ...createdJobs]);
+    setDrafts((currentDrafts) => ({ ...currentDrafts, ...Object.fromEntries(createdJobs.map((job) => [job.id, defaultDraft(job)])) }));
+    const failed = (result.photos || []).filter((photo) => photo.error);
+    if (failed.length) setError(`${failed.length} ${failed.length === 1 ? "photo" : "photos"} could not be imported: ${failed.map((photo) => `${photo.filename} (${photo.error})`).join("; ")}`);
+    if (!createdJobs.length && !failed.length) setNotice({ tone: "complete", text: "No clothing detected", detail: "We couldn’t find a distinct wearable item in those photos. Try clearer or more tightly framed photos." });
+  }, []);
+
+  const importAlbum = useCallback(async () => {
+    if (!setup?.ready) { setOpen(true); return; }
+    const link = albumLink.trim();
+    if (!link) return;
+    setError(""); setNotice(null); setOpen(true);
+    setGoogleStep("Finding clothes in your album");
+    try {
+      const result = await api(`${GOOGLE_API}/album`, { method: "POST", body: JSON.stringify({ url: link }) });
+      addGoogleResult(result);
+      setAlbumLink("");
+      if (result.found > result.limit) setNotice((current) => current || { tone: "complete", text: `Imported the first ${result.limit} photos`, detail: `The album has ${result.found} photos. Put the rest in a smaller album to import them.` });
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setGoogleStep("");
+    }
+  }, [setup, albumLink, addGoogleResult]);
+
+  const importFromGooglePhotos = useCallback(async () => {
+    if (!setup?.ready) { setOpen(true); return; }
+    // Open the window now, while the click still counts as a user gesture, so pop-up blockers allow it.
+    const popup = window.open("", "wardrobe-google-photos", "popup,width=1040,height=780");
+    setError(""); setNotice(null); setOpen(true);
+    let sessionId = null;
+    try {
+      if (!popup) throw new Error("Allow pop-ups for this site to import from Google Photos.");
+      const status = await api(`${GOOGLE_API}/status`);
+      if (!status.connected) {
+        setGoogleStep("Sign in to Google Photos");
+        popup.location.href = `${GOOGLE_API}/connect`;
+        await waitForGoogleConnection(popup);
+        setGooglePhotos({ ...status, connected: true });
+      }
+      setGoogleStep("Pick photos in Google Photos");
+      const session = await api(`${GOOGLE_API}/sessions`, { method: "POST" });
+      sessionId = session.id;
+      popup.location.href = `${session.pickerUri}/autoclose`;
+      const deadline = Date.now() + session.timeoutIn * 1000;
+      let current = session;
+      while (!current.mediaItemsSet) {
+        if (Date.now() > deadline) throw new Error("The Google Photos picker timed out. Try again.");
+        const closed = popup.closed;
+        await wait(closed ? 0 : session.pollInterval * 1000);
+        current = await api(`${GOOGLE_API}/sessions/${sessionId}`);
+        if (closed && !current.mediaItemsSet) {
+          await api(`${GOOGLE_API}/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
+          sessionId = null;
+          return;
+        }
+      }
+      if (!popup.closed) popup.close();
+      setGoogleStep("Finding clothes in your photos");
+      const result = await api(`${GOOGLE_API}/sessions/${sessionId}/import`, { method: "POST" });
+      sessionId = null;
+      addGoogleResult(result);
+    } catch (requestError) {
+      setError(requestError.message);
+      if (popup && !popup.closed) popup.close();
+      if (sessionId) api(`${GOOGLE_API}/sessions/${sessionId}`, { method: "DELETE" }).catch(() => {});
+      if (/connect/i.test(requestError.message)) api(`${GOOGLE_API}/status`).then(setGooglePhotos).catch(() => {});
+    } finally {
+      setGoogleStep("");
+    }
+  }, [setup, addGoogleResult]);
 
   useEffect(() => {
     let depth = 0;
@@ -259,13 +354,24 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
 
   const active = jobs[jobs.length - 1];
   const setupRequired = setup?.ready === false;
-  const activeStatus = setupRequired ? { tone: "error", text: "Setup required" } : active ? deriveStatus(active) : notice;
+  const activeStatus = setupRequired ? { tone: "error", text: "Setup required" } : googleStep ? { tone: "processing", text: googleStep } : active ? deriveStatus(active) : notice;
   const readyCount = jobs.filter((job) => deriveStatus(job).tone === "ready").length;
   const selectedReviewJob = jobs.find((job) => job.id === selectedReviewId && (reviewStageFor(job) || hasCleanupFailure(job)));
   const reviewJob = selectedReviewJob || jobs.find((job) => reviewStageFor(job)) || jobs.find((job) => hasCleanupFailure(job)) || active;
   const reviewStage = reviewJob ? reviewStageFor(reviewJob) : null;
   const progress = 0;
-  const hasImportActivity = Boolean(jobs.length || notice || setupRequired);
+  const hasImportActivity = Boolean(jobs.length || notice || setupRequired || googleStep);
+  const albumForm = (
+    <form className="import-album-form" onSubmit={(event) => { event.preventDefault(); importAlbum(); }}>
+      <input type="url" inputMode="url" aria-label="Google Photos album link" placeholder="Paste a Google Photos album link" value={albumLink} disabled={!setup?.ready || Boolean(googleStep)} onChange={(event) => setAlbumLink(event.target.value)} />
+      <button className="import-button" type="submit" disabled={!setup?.ready || Boolean(googleStep) || !albumLink.trim()}><GooglePhotosLogo size={14} /> Import album</button>
+    </form>
+  );
+  const googleButton = googlePhotos?.configured && (
+    <button className="import-button" disabled={!setup?.ready || Boolean(googleStep)} onClick={importFromGooglePhotos}>
+      {googleStep ? <SpinnerGap size={14} className="import-spinner" /> : <GooglePhotosLogo size={14} />} {googleStep || "Google Photos"}
+    </button>
+  );
 
   return (
     <>
@@ -273,17 +379,17 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
       <div className="import-drop-overlay" data-active={dragging && !setupRequired} aria-hidden={!dragging || setupRequired}><div className="import-drop-target is-over"><UploadSimple size={34} weight="light" /><h2>Drop clothing images</h2><p>A single garment or a photo of a full outfit works. Your wardrobe stays exactly where you left it.</p></div></div>
       <aside className={`import-tray${hasImportActivity ? " is-expanded" : ""}`} aria-label="Wardrobe imports">
         <button className="import-tray__button" type="button" onClick={() => setupRequired || hasImportActivity ? setOpen(true) : inputRef.current?.click()} aria-label={setupRequired ? "Open setup instructions" : hasImportActivity ? "Open import progress" : "Add clothes"}>{activeStatus?.tone === "processing" ? <SpinnerGap size={19} className="import-spinner" /> : activeStatus?.tone === "error" ? <WarningCircle size={19} /> : readyCount ? <span>{readyCount}</span> : notice ? <X size={18} /> : <Plus size={19} />}</button>
-        <div className="import-tray__actions">{active && <img className="import-tray__preview" src={active.stages?.garment?.assetUrl || active.stages?.garment?.failedAssetUrl || active.stages?.crop?.assetUrl || active.originalAssetUrl} alt="" />}<span className="import-tray__label">{activeStatus?.text || "Add clothes"}</span>{!setupRequired && <button className="import-icon-button" type="button" onClick={() => inputRef.current?.click()} aria-label="Choose images"><UploadSimple size={17} /></button>}</div>
+        <div className="import-tray__actions">{active && <img className="import-tray__preview" src={active.stages?.garment?.assetUrl || active.stages?.garment?.failedAssetUrl || active.stages?.crop?.assetUrl || active.originalAssetUrl} alt="" />}<span className="import-tray__label">{activeStatus?.text || "Add clothes"}</span>{!setupRequired && <button className="import-icon-button" type="button" onClick={() => inputRef.current?.click()} aria-label="Choose images"><UploadSimple size={17} /></button>}{!setupRequired && <button className="import-icon-button" type="button" onClick={() => setOpen(true)} aria-label="Import from Google Photos"><GooglePhotosLogo size={17} /></button>}</div>
       </aside>
       <div className="import-popover-backdrop" data-open={open} onMouseDown={(event) => event.target === event.currentTarget && setOpen(false)}>
         <section className="import-popover" role="dialog" aria-modal="true" aria-labelledby="import-title">
           <header className="import-popover__header"><div><p className="import-popover__eyebrow">Wardrobe import</p><h2 className="import-popover__title" id="import-title">{readyCount ? `${readyCount} ready for review` : activeStatus?.tone === "error" ? "Import needs attention" : jobs.length ? "Preparing new pieces" : notice?.text || "Add to your wardrobe"}</h2></div><button className="import-icon-button" type="button" onClick={() => setOpen(false)} aria-label="Close import progress"><X size={20} /></button></header>
-          {!jobs.length ? setupRequired ? <div className="import-drop-target import-setup-warning"><WarningCircle size={30} /><h2>Setup required</h2><p>Add your OpenAI API key to <code>.env</code> and a PNG reference photo of yourself at <code>{setup.modelReference || "data/model-reference.png"}</code>, then restart the app.</p></div> : <div className="import-drop-target"><UploadSimple size={28} /><h2>{notice ? "Try another image" : "Choose or paste an image"}</h2><p>{notice?.detail || "We’ll isolate each clothing item, suggest its details, and hold everything for your approval."}</p><button className="import-button import-button--primary" disabled={!setup?.ready} onClick={() => { setNotice(null); inputRef.current?.click(); }}>Choose images</button></div> : (
+          {!jobs.length ? setupRequired ? <div className="import-drop-target import-setup-warning"><WarningCircle size={30} /><h2>Setup required</h2><p>Add your OpenAI API key to <code>.env</code> and a PNG reference photo of yourself at <code>{setup.modelReference || "data/model-reference.png"}</code>, then restart the app.</p></div> : <div className="import-drop-target"><UploadSimple size={28} /><h2>{notice ? "Try another image" : "Choose or paste an image"}</h2><p>{notice?.detail || "We’ll isolate each clothing item, suggest its details, and hold everything for your approval."}</p><div className="import-actions"><button className="import-button import-button--primary" disabled={!setup?.ready} onClick={() => { setNotice(null); inputRef.current?.click(); }}>Choose images</button>{googleButton}</div>{albumForm}</div> : (
             <>
               <div className={`import-progress${activeStatus?.tone !== "processing" ? " is-reviewing" : progress < 100 ? " is-indeterminate" : ""}`}><div className="import-progress__meta"><span>{activeStatus?.text}</span><span>{jobs.length} {jobs.length === 1 ? "item" : "items"}</span></div>{activeStatus?.tone === "processing" && <div className="import-progress__track"><div className="import-progress__bar" style={{ "--import-progress": `${progress}%` }} /></div>}</div>
               {reviewJob && reviewStage ? <ReviewEditor job={reviewJob} stage={reviewStage} draft={drafts[reviewJob.id] || defaultDraft(reviewJob)} setDraft={(draft) => setDrafts((current) => ({ ...current, [reviewJob.id]: draft }))} regenPrompt={regenerationPrompts[`${reviewJob.id}:${reviewStage}`] || ""} setRegenPrompt={(prompt) => setRegenerationPrompts((current) => ({ ...current, [`${reviewJob.id}:${reviewStage}`]: prompt }))} busy={busyId === reviewJob.id} onAction={(action, prompt) => perform(reviewJob, reviewStage, action, prompt)} /> : reviewJob && hasCleanupFailure(reviewJob) ? <CleanupEditor job={reviewJob} tolerance={cleanupTolerances[reviewJob.id] ?? reviewJob.stages.garment.cleanupTolerance ?? 46} setTolerance={(tolerance) => setCleanupTolerances((current) => ({ ...current, [reviewJob.id]: tolerance }))} busy={busyId === reviewJob.id} onPreview={(tolerance) => performCleanup(reviewJob, "preview", tolerance)} onAccept={() => performCleanup(reviewJob, "accept")} /> : null}
               <div className="import-card-list">{jobs.map((job) => { const status = deriveStatus(job); const itemName = drafts[job.id]?.name || job.metadata?.name || "New piece"; const failedStage = job.stages?.garment?.status === "failed" ? "garment" : job.stages?.modeled?.status === "failed" ? "modeled" : null; return <article className={`import-card is-${status.tone}${reviewJob?.id === job.id ? " is-selected" : ""}`} key={job.id}><img className="import-card__image" src={job.stages?.garment?.assetUrl || job.stages?.garment?.failedAssetUrl || job.stages?.crop?.assetUrl || job.originalAssetUrl} alt="" /><div className="import-card__body"><h3 className="import-card__title">{itemName}</h3><p className="import-card__detail import-card__detail--status" data-tone={status.tone}>{status.tone === "error" ? status.detail : status.text}</p></div><div className="import-card__actions">{status.tone === "ready" && <button className="import-icon-button" onClick={() => { setSelectedReviewId(job.id); setOpen(true); }} aria-label={`Review ${itemName}`}><Check size={17} /></button>}{failedStage && <button className="import-button import-card__retry" disabled={busyId === job.id} onClick={() => perform(job, failedStage, "regenerate", "")}><ArrowCounterClockwise size={14} /> Retry</button>}<button className="import-icon-button import-card__delete" disabled={busyId === job.id} onClick={() => deleteJob(job)} aria-label={`Delete ${itemName} from import queue`}><Trash size={16} /></button></div></article>; })}</div>
-              <div className="import-actions"><button className="import-button" onClick={() => inputRef.current?.click()}><Plus size={14} /> Add another</button></div>
+              {albumForm}<div className="import-actions">{googleButton}<button className="import-button" onClick={() => inputRef.current?.click()}><Plus size={14} /> Add another</button></div>
             </>
           )}
           {error && <p className="import-status is-error" role="alert">{error}</p>}

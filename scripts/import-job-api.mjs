@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
+import { GOOGLE_PHOTOS_MAX_ITEMS, createGooglePhotosClient, downloadSharedAlbumPhoto, fetchSharedAlbum } from "./google-photos.mjs";
 
 const API_ROOT = "/api/import/jobs";
+const GOOGLE_ROOT = "/api/import/google-photos";
 const ASSET_ROOT = "/api/import/assets";
 const LIBRARY_ASSET_ROOT = "/api/import/library";
 const STAGES = new Set(["crop", "garment", "modeled"]);
@@ -29,6 +31,32 @@ async function body(req, limit = 25 * 1024 * 1024) {
   if (!chunks.length) return {};
   try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
   catch { throw Object.assign(new Error("Expected a JSON request body"), { status: 400 }); }
+}
+
+function html(res, status, markup) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.end(markup);
+}
+
+function googleCallbackPage(ok, message) {
+  const payload = JSON.stringify({ type: "wardrobe:google-photos", ok, message }).replace(/</g, "\\u003c");
+  const text = message.replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char]);
+  return `<!doctype html><meta charset="utf-8"><title>Google Photos</title><body style="font:15px system-ui;padding:32px"><p>${text}</p><script>window.opener?.postMessage(${payload}, location.origin);</script></body>`;
+}
+
+async function mapLimit(values, limit, task) {
+  const results = new Array(values.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < values.length) {
+      const index = next++;
+      results[index] = await task(values[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
+  return results;
 }
 
 function publicJob(job) {
@@ -342,12 +370,130 @@ async function openAIAnalyze({ key, baseUrl, model, image, mime }) {
 
 export function wardrobeImportApi(options = {}) {
   let root;
+  let dataDir;
   let jobsDir;
   let importedFile;
   let libraryAssetDir;
   const running = new Map();
   const setting = (name, fallback = "") => options.env?.[name] || process.env[name] || fallback;
   const apiBaseUrl = () => setting("OPENAI_API_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, "");
+  const googlePhotos = createGooglePhotosClient({
+    clientId: () => setting("GOOGLE_CLIENT_ID").trim(),
+    clientSecret: () => setting("GOOGLE_CLIENT_SECRET").trim(),
+    tokenFile: () => path.join(dataDir, "google-photos-token.json"),
+  });
+
+  function googleRedirectUri(req) {
+    const configured = setting("GOOGLE_PHOTOS_REDIRECT_URI").trim();
+    if (configured) return configured;
+    const proto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim() || (req.socket.encrypted ? "https" : "http");
+    return `${proto}://${req.headers.host}${GOOGLE_ROOT}/callback`;
+  }
+
+  async function requireReady() {
+    const setup = await setupStatus();
+    if (setup.ready) return;
+    const missing = [
+      !setup.hasApiKey && "OPENAI_API_KEY in .env",
+      !setup.hasModelReference && `a PNG photo of yourself at ${setup.modelReference}`,
+    ].filter(Boolean).join(" and ");
+    throw Object.assign(new Error(`Setup required: add ${missing}, then restart the app.`), { status: 503 });
+  }
+
+  async function createJobsFromImage(imageBytes) {
+    const normalizedImage = await normalizeImage(imageBytes);
+    const key = setting("OPENAI_API_KEY");
+    const detected = (await openAIAnalyze({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_VISION_MODEL", "gpt-5.4-mini"), image: normalizedImage, mime: "image/png" })).map(normalizeMetadata);
+    const jobs = [];
+    for (const metadata of detected) {
+      const id = randomUUID();
+      const dir = path.join(jobsDir, id); await mkdir(dir, { recursive: true });
+      const originalFile = "original.png";
+      const cropFile = "crop.png";
+      const croppedImage = await cropDetectedItem(normalizedImage, metadata.boundingBox);
+      await writeFile(path.join(dir, originalFile), normalizedImage);
+      await writeFile(path.join(dir, cropFile), croppedImage);
+      const now = new Date().toISOString();
+      const cropStage = { ...stageState(), status: "review", assetUrl: `${ASSET_ROOT}/${id}/${cropFile}`, updatedAt: now };
+      const job = { id, status: "active", metadata, stages: { crop: cropStage, garment: stageState(), modeled: stageState() }, createdAt: now, updatedAt: now, internal: { originalFile, cropFile, originalMime: "image/png" } };
+      job.originalAssetUrl = `${ASSET_ROOT}/${id}/${originalFile}`;
+      await saveJob(job); jobs.push(publicJob(job));
+    }
+    return jobs;
+  }
+
+  async function importDownloadedPhotos(photos, download) {
+    const results = await mapLimit(photos, 3, async (photo) => {
+      try {
+        return { filename: photo.filename, jobs: await createJobsFromImage(await download(photo)) };
+      } catch (error) {
+        return { filename: photo.filename, jobs: [], error: error.message };
+      }
+    });
+    return {
+      jobs: results.flatMap((result) => result.jobs),
+      photos: results.map(({ filename, jobs, error }) => ({ filename, items: jobs.length, error: error || null })),
+    };
+  }
+
+  async function googlePhotosHandler(req, res, url) {
+    if (url.pathname === `${GOOGLE_ROOT}/status` && req.method === "GET") {
+      return json(res, 200, { configured: googlePhotos.configured(), connected: await googlePhotos.connected(), maxItems: GOOGLE_PHOTOS_MAX_ITEMS });
+    }
+    if (url.pathname === `${GOOGLE_ROOT}/album` && req.method === "POST") {
+      await requireReady();
+      const input = await body(req, 16 * 1024);
+      const album = await fetchSharedAlbum(input.url);
+      const photos = album.photoUrls.slice(0, GOOGLE_PHOTOS_MAX_ITEMS).map((photoUrl, index) => ({ photoUrl, filename: `${album.title || "Album"} photo ${index + 1}` }));
+      const result = await importDownloadedPhotos(photos, (photo) => downloadSharedAlbumPhoto(photo.photoUrl));
+      return json(res, 202, { ...result, title: album.title, found: album.photoUrls.length, limit: GOOGLE_PHOTOS_MAX_ITEMS });
+    }
+    if (!googlePhotos.configured()) throw Object.assign(new Error("Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to .env, then restart the app."), { status: 503 });
+    if (url.pathname === `${GOOGLE_ROOT}/connect` && req.method === "GET") {
+      res.statusCode = 302;
+      res.setHeader("Location", googlePhotos.authorizationUrl(googleRedirectUri(req)));
+      return res.end();
+    }
+    if (url.pathname === `${GOOGLE_ROOT}/callback` && req.method === "GET") {
+      const denied = url.searchParams.get("error");
+      if (denied) return html(res, 400, googleCallbackPage(false, `Google Photos was not connected (${denied}).`));
+      try {
+        await googlePhotos.exchangeCode(url.searchParams.get("code") || "", url.searchParams.get("state") || "");
+      } catch (error) {
+        return html(res, error.status || 500, googleCallbackPage(false, error.message));
+      }
+      return html(res, 200, googleCallbackPage(true, "Google Photos is connected. Opening the photo picker…"));
+    }
+    if (url.pathname === `${GOOGLE_ROOT}/connection` && req.method === "DELETE") {
+      await googlePhotos.disconnect();
+      return json(res, 200, { connected: false });
+    }
+    if (url.pathname === `${GOOGLE_ROOT}/sessions` && req.method === "POST") {
+      await requireReady();
+      return json(res, 201, await googlePhotos.createSession());
+    }
+    const sessionMatch = url.pathname.match(/^\/api\/import\/google-photos\/sessions\/([\w-]{1,200})(\/import)?$/);
+    if (sessionMatch && !sessionMatch[2] && req.method === "GET") return json(res, 200, await googlePhotos.getSession(sessionMatch[1]));
+    if (sessionMatch && !sessionMatch[2] && req.method === "DELETE") {
+      await googlePhotos.deleteSession(sessionMatch[1]);
+      return json(res, 200, { deleted: true });
+    }
+    if (sessionMatch && sessionMatch[2] && req.method === "POST") {
+      await requireReady();
+      const sessionId = sessionMatch[1];
+      const session = await googlePhotos.getSession(sessionId);
+      if (!session.mediaItemsSet) throw Object.assign(new Error("Pick photos in Google Photos first."), { status: 409 });
+      const items = await googlePhotos.listMediaItems(sessionId);
+      const photos = items.filter((item) => item.type !== "VIDEO").slice(0, GOOGLE_PHOTOS_MAX_ITEMS);
+      const result = await importDownloadedPhotos(
+        photos.map((item) => ({ item, filename: item.mediaFile?.filename || "Google Photos image" })),
+        (photo) => googlePhotos.downloadPhoto(photo.item),
+      );
+      await googlePhotos.deleteSession(sessionId);
+      return json(res, 202, { ...result, skippedVideos: items.length - photos.length });
+    }
+    return json(res, 404, { error: "Not found" });
+  }
 
   async function setupStatus() {
     const hasApiKey = Boolean(setting("OPENAI_API_KEY").trim());
@@ -494,6 +640,7 @@ export function wardrobeImportApi(options = {}) {
       if (url.pathname === "/api/import/wardrobe" && req.method === "GET") {
         return json(res, 200, await loadImported());
       }
+      if (url.pathname.startsWith(`${GOOGLE_ROOT}/`)) return await googlePhotosHandler(req, res, url);
       if (url.pathname === "/api/import/config" && req.method === "GET") {
         return json(res, 200, await setupStatus());
       }
@@ -527,34 +674,10 @@ export function wardrobeImportApi(options = {}) {
         return res.end(await readFile(file));
       }
       if (url.pathname === API_ROOT && req.method === "POST") {
-        const setup = await setupStatus();
-        if (!setup.ready) {
-          const missing = [
-            !setup.hasApiKey && "OPENAI_API_KEY in .env",
-            !setup.hasModelReference && `a PNG photo of yourself at ${setup.modelReference}`,
-          ].filter(Boolean).join(" and ");
-          return json(res, 503, { error: `Setup required: add ${missing}, then restart the app.` });
-        }
+        await requireReady();
         const input = await body(req);
         const image = decodeImage(input);
-        const normalizedImage = await normalizeImage(image.data);
-        const key = setting("OPENAI_API_KEY");
-        const detected = (await openAIAnalyze({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_VISION_MODEL", "gpt-5.4-mini"), image: normalizedImage, mime: "image/png" })).map(normalizeMetadata);
-        const jobs = [];
-        for (const metadata of detected) {
-          const id = randomUUID();
-          const dir = path.join(jobsDir, id); await mkdir(dir, { recursive: true });
-          const originalFile = "original.png";
-          const cropFile = "crop.png";
-          const croppedImage = await cropDetectedItem(normalizedImage, metadata.boundingBox);
-          await writeFile(path.join(dir, originalFile), normalizedImage);
-          await writeFile(path.join(dir, cropFile), croppedImage);
-          const now = new Date().toISOString();
-          const cropStage = { ...stageState(), status: "review", assetUrl: `${ASSET_ROOT}/${id}/${cropFile}`, updatedAt: now };
-          const job = { id, status: "active", metadata, stages: { crop: cropStage, garment: stageState(), modeled: stageState() }, createdAt: now, updatedAt: now, internal: { originalFile, cropFile, originalMime: "image/png" } };
-          job.originalAssetUrl = `${ASSET_ROOT}/${id}/${originalFile}`;
-          await saveJob(job); jobs.push(publicJob(job));
-        }
+        const jobs = await createJobsFromImage(image.data);
         return json(res, 202, { jobs, noClothingDetected: jobs.length === 0 });
       }
       if (url.pathname === API_ROOT && req.method === "GET") {
@@ -666,7 +789,7 @@ export function wardrobeImportApi(options = {}) {
     apply: "serve",
     async configResolved(config) {
       root = config.root;
-      const dataDir = path.resolve(root, setting("WARDROBE_DATA_DIR", "data"));
+      dataDir = path.resolve(root, setting("WARDROBE_DATA_DIR", "data"));
       jobsDir = path.join(dataDir, "jobs");
       importedFile = path.join(dataDir, "library.json");
       libraryAssetDir = path.join(dataDir, "imported");
