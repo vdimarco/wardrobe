@@ -54,6 +54,18 @@ If you are setting up Wardrobe for a user, ask how they want to import their clo
 - Generates an optional modeled editorial preview
 - Keeps originals, jobs, generated images, and the JSON database local in `data/`
 - Supports drag, drop, paste, editing, review, regeneration, and approval
+- Imports photos you pick from Google Photos
+
+## Import from Google Photos
+
+The app uses the [Google Photos Picker API](https://developers.google.com/photos/picker/guides/get-started-picker). You pick up to 20 photos in Google's own picker. The app downloads only those photos and sends each one through the normal import review.
+
+1. In Google Cloud Console, enable the **Google Photos Picker API**.
+2. Set up the OAuth consent screen. Add yourself as a test user.
+3. Create an OAuth client of type **Web application**. Add `http://localhost:5173/api/import/google-photos/callback` as an authorized redirect URI. For a deployed app, add its own URL and set `GOOGLE_PHOTOS_REDIRECT_URI` to the same value.
+4. Add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to `.env` and restart the app.
+
+A **Google Photos** button then shows in the import panel. The first time you use it, a window asks you to sign in to Google. The app keeps the token at `data/google-photos-token.json`. Delete that file to disconnect.
 
 ## Configuration
 
@@ -65,6 +77,9 @@ If you are setting up Wardrobe for a user, ask how they want to import their clo
 | `OPENAI_IMAGE_QUALITY` | `high` |
 | `WARDROBE_MODEL_REFERENCE` | `data/model-reference.png` |
 | `WARDROBE_DATA_DIR` | `data` |
+| `GOOGLE_CLIENT_ID` | Optional, for Google Photos |
+| `GOOGLE_CLIENT_SECRET` | Optional, for Google Photos |
+| `GOOGLE_PHOTOS_REDIRECT_URI` | `<app origin>/api/import/google-photos/callback` |
 
 ## License
 
