@@ -9,6 +9,8 @@ const PICKER_API = "https://photospicker.googleapis.com/v1";
 const SCOPE = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly";
 const STATE_TTL_MS = 10 * 60 * 1000;
 export const GOOGLE_PHOTOS_MAX_ITEMS = 20;
+const ALBUM_HOSTS = new Set(["photos.app.goo.gl", "goo.gl", "photos.google.com"]);
+const ALBUM_PHOTO_URL = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\w-]+)"/g;
 
 function durationSeconds(value, fallback) {
   const parsed = Number.parseFloat(String(value ?? "").replace(/s$/, ""));
@@ -171,4 +173,40 @@ export function createGooglePhotosClient({ clientId, clientSecret, tokenFile }) 
     listMediaItems,
     downloadPhoto,
   };
+}
+
+// Shared album links are not part of any Google API. The album page embeds the
+// photo URLs in its inline data, so we read them from the HTML. This can break
+// if Google changes that page.
+export async function fetchSharedAlbum(link) {
+  let url;
+  try { url = new URL(String(link || "").trim()); }
+  catch { throw Object.assign(new Error("Paste a Google Photos album link, such as https://photos.app.goo.gl/…"), { status: 400 }); }
+  for (let hop = 0; hop < 5; hop += 1) {
+    if (url.protocol !== "https:" || !ALBUM_HOSTS.has(url.hostname)) {
+      throw Object.assign(new Error("That is not a Google Photos album link."), { status: 400 });
+    }
+    const response = await fetch(url, { redirect: "manual", headers: { "User-Agent": "Mozilla/5.0 (compatible; Wardrobe)", "Accept-Language": "en" } });
+    const location = response.headers.get("location");
+    if (response.status >= 300 && response.status < 400 && location) {
+      url = new URL(location, url);
+      continue;
+    }
+    if (!response.ok) throw Object.assign(new Error(`Google Photos did not open that album (${response.status}). Check that the album is shared by link.`), { status: 502 });
+    if (url.hostname !== "photos.google.com" || !url.pathname.includes("/share/")) {
+      throw Object.assign(new Error("That link does not open a shared Google Photos album."), { status: 400 });
+    }
+    const page = await response.text();
+    const photoUrls = [...new Set([...page.matchAll(ALBUM_PHOTO_URL)].map((match) => match[1]))];
+    if (!photoUrls.length) throw Object.assign(new Error("No photos were found in that album. Check that it is shared by link and is not empty."), { status: 422 });
+    const title = page.match(/<meta property="og:title" content="([^"]*)"/)?.[1] || null;
+    return { title, photoUrls };
+  }
+  throw Object.assign(new Error("That album link redirected too many times."), { status: 502 });
+}
+
+export async function downloadSharedAlbumPhoto(photoUrl) {
+  const response = await fetch(`${photoUrl}=w2048-h2048`);
+  if (!response.ok) throw new Error(`Google Photos download failed (${response.status})`);
+  return Buffer.from(await response.arrayBuffer());
 }

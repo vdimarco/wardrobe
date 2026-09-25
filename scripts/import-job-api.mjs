@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
-import { GOOGLE_PHOTOS_MAX_ITEMS, createGooglePhotosClient } from "./google-photos.mjs";
+import { GOOGLE_PHOTOS_MAX_ITEMS, createGooglePhotosClient, downloadSharedAlbumPhoto, fetchSharedAlbum } from "./google-photos.mjs";
 
 const API_ROOT = "/api/import/jobs";
 const GOOGLE_ROOT = "/api/import/google-photos";
@@ -422,9 +422,31 @@ export function wardrobeImportApi(options = {}) {
     return jobs;
   }
 
+  async function importDownloadedPhotos(photos, download) {
+    const results = await mapLimit(photos, 3, async (photo) => {
+      try {
+        return { filename: photo.filename, jobs: await createJobsFromImage(await download(photo)) };
+      } catch (error) {
+        return { filename: photo.filename, jobs: [], error: error.message };
+      }
+    });
+    return {
+      jobs: results.flatMap((result) => result.jobs),
+      photos: results.map(({ filename, jobs, error }) => ({ filename, items: jobs.length, error: error || null })),
+    };
+  }
+
   async function googlePhotosHandler(req, res, url) {
     if (url.pathname === `${GOOGLE_ROOT}/status` && req.method === "GET") {
       return json(res, 200, { configured: googlePhotos.configured(), connected: await googlePhotos.connected(), maxItems: GOOGLE_PHOTOS_MAX_ITEMS });
+    }
+    if (url.pathname === `${GOOGLE_ROOT}/album` && req.method === "POST") {
+      await requireReady();
+      const input = await body(req, 16 * 1024);
+      const album = await fetchSharedAlbum(input.url);
+      const photos = album.photoUrls.slice(0, GOOGLE_PHOTOS_MAX_ITEMS).map((photoUrl, index) => ({ photoUrl, filename: `${album.title || "Album"} photo ${index + 1}` }));
+      const result = await importDownloadedPhotos(photos, (photo) => downloadSharedAlbumPhoto(photo.photoUrl));
+      return json(res, 202, { ...result, title: album.title, found: album.photoUrls.length, limit: GOOGLE_PHOTOS_MAX_ITEMS });
     }
     if (!googlePhotos.configured()) throw Object.assign(new Error("Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to .env, then restart the app."), { status: 503 });
     if (url.pathname === `${GOOGLE_ROOT}/connect` && req.method === "GET") {
@@ -463,20 +485,12 @@ export function wardrobeImportApi(options = {}) {
       if (!session.mediaItemsSet) throw Object.assign(new Error("Pick photos in Google Photos first."), { status: 409 });
       const items = await googlePhotos.listMediaItems(sessionId);
       const photos = items.filter((item) => item.type !== "VIDEO").slice(0, GOOGLE_PHOTOS_MAX_ITEMS);
-      const results = await mapLimit(photos, 3, async (item) => {
-        const filename = item.mediaFile?.filename || "Google Photos image";
-        try {
-          return { filename, jobs: await createJobsFromImage(await googlePhotos.downloadPhoto(item)) };
-        } catch (error) {
-          return { filename, jobs: [], error: error.message };
-        }
-      });
+      const result = await importDownloadedPhotos(
+        photos.map((item) => ({ item, filename: item.mediaFile?.filename || "Google Photos image" })),
+        (photo) => googlePhotos.downloadPhoto(photo.item),
+      );
       await googlePhotos.deleteSession(sessionId);
-      return json(res, 202, {
-        jobs: results.flatMap((result) => result.jobs),
-        photos: results.map(({ filename, jobs, error }) => ({ filename, items: jobs.length, error: error || null })),
-        skippedVideos: items.length - photos.length,
-      });
+      return json(res, 202, { ...result, skippedVideos: items.length - photos.length });
     }
     return json(res, 404, { error: "Not found" });
   }

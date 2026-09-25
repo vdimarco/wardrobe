@@ -54,11 +54,19 @@ If you are setting up Wardrobe for a user, ask how they want to import their clo
 - Generates an optional modeled editorial preview
 - Keeps originals, jobs, generated images, and the JSON database local in `data/`
 - Supports drag, drop, paste, editing, review, regeneration, and approval
-- Imports photos you pick from Google Photos
+- Imports photos from a shared Google Photos album link or from the Google Photos picker
 
 ## Import from Google Photos
 
-The app uses the [Google Photos Picker API](https://developers.google.com/photos/picker/guides/get-started-picker). You pick up to 20 photos in Google's own picker. The app downloads only those photos and sends each one through the normal import review.
+### Shared album link
+
+Share an album by link in Google Photos, then paste the link into the import panel. You do not need any setup. The app imports the first 20 photos in the album.
+
+This uses no Google API. The app reads the photo links from the album's web page, so it can stop working if Google changes that page. Anyone who has the album link can see its photos.
+
+### Photo picker
+
+The picker uses the [Google Photos Picker API](https://developers.google.com/photos/picker/guides/get-started-picker). You pick up to 20 photos in Google's own picker. The app downloads only those photos and sends each one through the normal import review.
 
 1. In Google Cloud Console, enable the **Google Photos Picker API**.
 2. Set up the OAuth consent screen. Add yourself as a test user.

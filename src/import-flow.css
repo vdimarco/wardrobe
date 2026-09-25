@@ -262,6 +262,10 @@
 .import-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
 .import-button { min-height: 40px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 0 16px; border: 1px solid var(--import-line); border-radius: 999px; color: var(--import-ink); background: transparent; font: 500 12px/1 "Instrument Sans", sans-serif; cursor: pointer; }
 .import-drop-target .import-actions { justify-content: center; margin-top: 8px; }
+.import-album-form { display: flex; gap: 8px; width: min(460px, 100%); margin-top: 22px; }
+.import-drop-target .import-album-form { margin: 4px auto 0; }
+.import-album-form input { flex: 1; min-width: 0; min-height: 40px; padding: 0 14px; border: 1px solid var(--import-line); border-radius: 999px; color: var(--import-ink); background: var(--import-paper); font: 400 13px/1 "Instrument Sans", sans-serif; }
+.import-album-form input:disabled { opacity: 0.42; }
 .import-button--primary { color: var(--import-paper); background: var(--import-ink); border-color: var(--import-ink); }
 .import-button:disabled { cursor: default; opacity: 0.42; }
 
