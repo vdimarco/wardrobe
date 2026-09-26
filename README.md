@@ -54,7 +54,23 @@ If you are setting up Wardrobe for a user, ask how they want to import their clo
 - Generates an optional modeled editorial preview
 - Keeps originals, jobs, generated images, and the JSON database local in `data/`
 - Supports drag, drop, paste, editing, review, regeneration, and approval
+- Finds you in each photo with your reference photo, and imports only what you wear or carry
+- Skips pieces that are already in your wardrobe or in the import queue
 - Imports photos from a shared Google Photos album link or from the Google Photos picker
+
+## Keyboard shortcuts
+
+| Key | Action |
+| --- | --- |
+| `I` | Open the import panel |
+| `Enter` or `A` | Approve, or update the crop after you draw a new box |
+| `X` | Reject the item |
+| `R` | Regenerate the image |
+| `Z` | Undo the new crop box |
+| `J` / `K` or arrow keys | Next or previous item to review |
+| `Esc` | Undo the new crop box, or close the panel |
+
+Shortcuts do nothing while you type in a field. Press `Esc` to leave the field first.
 
 ## Import from Google Photos
 
