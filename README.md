@@ -74,15 +74,20 @@ Shortcuts do nothing while you type in a field. Press `Esc` to leave the field f
 
 ## Import from Google Photos
 
-### Shared album link
+Google Photos imports run in the background on the server, and you can close the browser while they run. The import panel shows the progress of each import, with buttons to pause, resume and cancel it. New items go to the review queue as the import finds them. An import continues after a restart.
 
-Share an album by link in Google Photos, then paste the link into the import panel. You do not need any setup. The app imports the first 20 photos in the album.
+Each import works like this:
 
-This uses no Google API. The app reads the photo links from the album's web page, so it can stop working if Google changes that page. Anyone who has the album link can see its photos.
+1. The server downloads the photos first, because Google's download links expire.
+2. It skips photos that look almost the same as a photo it already checked, such as burst shots.
+3. A cheap, low-detail check asks if the photo shows you with visible clothes. Landscapes, food, screenshots and photos of other people stop here.
+4. Only photos that pass get the full clothing detection. That step also skips pieces you already have.
 
-### Photo picker
+If 5 photos in a row fail, for example because the API key has no quota left, the import pauses and shows the error.
 
-The picker uses the [Google Photos Picker API](https://developers.google.com/photos/picker/guides/get-started-picker). You pick up to 20 photos in Google's own picker. The app downloads only those photos and sends each one through the normal import review.
+### Photo picker (recommended for big albums)
+
+The picker uses the [Google Photos Picker API](https://developers.google.com/photos/picker/guides/get-started-picker). You pick up to 2000 photos in Google's own picker for each import. For a bigger album, do more than one import. The app downloads only the photos you pick.
 
 1. In Google Cloud Console, enable the **Google Photos Picker API**.
 2. Set up the OAuth consent screen. Add yourself as a test user.
@@ -90,6 +95,12 @@ The picker uses the [Google Photos Picker API](https://developers.google.com/pho
 4. Add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` to `.env` and restart the app.
 
 A **Google Photos** button then shows in the import panel. The first time you use it, a window asks you to sign in to Google. The app keeps the token at `data/google-photos-token.json`. Delete that file to disconnect.
+
+### Shared album link
+
+Share an album by link in Google Photos, then paste the link into the import panel. You do not need any setup.
+
+This uses no Google API. The app reads the photo links from the album's web page, so it can stop working if Google changes that page. The page shows only part of a big album, so for a big album use the picker. Anyone who has the album link can see its photos.
 
 ## Configuration
 
@@ -102,6 +113,8 @@ A **Google Photos** button then shows in the import panel. The first time you us
 | `WARDROBE_MODEL_REFERENCE` | `<data dir>/model-reference.png` |
 | `WARDROBE_MODEL_REFERENCE_URL` | Optional. A PNG to download when the model reference file is missing |
 | `WARDROBE_DATA_DIR` | `RAILWAY_VOLUME_MOUNT_PATH` if set, else `data` |
+| `WARDROBE_BATCH_MAX_PHOTOS` | `5000`, the most photos one album link import takes |
+| `OPENAI_CHECK_MODEL` | `OPENAI_VISION_MODEL`, the model for the quick check in background imports |
 | `GOOGLE_CLIENT_ID` | Optional, for Google Photos |
 | `GOOGLE_CLIENT_SECRET` | Optional, for Google Photos |
 | `GOOGLE_PHOTOS_REDIRECT_URI` | `<app origin>/api/import/google-photos/callback` |

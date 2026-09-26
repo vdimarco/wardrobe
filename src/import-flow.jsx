@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowCounterClockwise, Check, GooglePhotosLogo, Plus, SpinnerGap, Trash, UploadSimple, WarningCircle, X } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, Check, GooglePhotosLogo, Pause, Play, Plus, SpinnerGap, Trash, UploadSimple, WarningCircle, X } from "@phosphor-icons/react";
 import "./import-flow.css";
 
 const API = "/api/import/jobs";
 const CONFIG_API = "/api/import/config";
 const GOOGLE_API = "/api/import/google-photos";
+const BATCH_API = "/api/import/batches";
+const ACTIVE_BATCH = new Set(["downloading", "running"]);
+const visibleJob = (job) => job.status !== "complete" && job.stages?.crop?.status !== "rejected" && job.stages?.garment?.status !== "rejected" && job.stages?.modeled?.status !== "rejected";
 const PARTS = [
   ["upperbody", "Tops"],
   ["wholebody_up", "Jackets"],
@@ -82,6 +85,48 @@ function defaultDraft(job) {
     secondaryColor: metadata.secondaryColor || "",
     tags: Array.isArray(metadata.tags) ? metadata.tags.join(", ") : (metadata.tags || ""),
   };
+}
+
+// Photos that are finished: checked, or failed to download (those are never checked).
+const batchProgress = (batch) => batch.state === "downloading" ? batch.counts.downloaded + batch.counts.downloadFailed : batch.counts.checked + batch.counts.downloadFailed;
+
+function batchSummary(batch) {
+  const { counts } = batch;
+  if (batch.state === "downloading") return `Downloading ${batchProgress(batch).toLocaleString()} of ${batch.total.toLocaleString()} photos`;
+  return [
+    `${batchProgress(batch).toLocaleString()} of ${batch.total.toLocaleString()} photos checked`,
+    `${counts.items.toLocaleString()} new ${counts.items === 1 ? "item" : "items"}`,
+    counts.alreadyOwned && `${counts.alreadyOwned.toLocaleString()} already owned`,
+    counts.duplicates && `${counts.duplicates.toLocaleString()} near-duplicates`,
+    counts.noClothes && `${counts.noClothes.toLocaleString()} without your clothes`,
+    counts.failed && `${counts.failed.toLocaleString()} failed`,
+  ].filter(Boolean).join(" · ");
+}
+
+const BATCH_STATE_LABELS = { downloading: "Downloading", running: "Importing", paused: "Paused", done: "Done", cancelled: "Cancelled", failed: "Failed" };
+
+function BatchCard({ batch, busy, onControl }) {
+  const percent = batch.total ? Math.min(100, Math.round((batchProgress(batch) / batch.total) * 100)) : 0;
+  const active = ACTIVE_BATCH.has(batch.state);
+  return (
+    <article className={`import-batch is-${batch.state}`}>
+      <div className="import-batch__head">
+        <div>
+          <h3 className="import-card__title">{batch.title}</h3>
+          <p className="import-card__detail">{BATCH_STATE_LABELS[batch.state] || batch.state} · {batchSummary(batch)}</p>
+          {batch.found > batch.total && <p className="import-card__detail">Only the first {batch.total.toLocaleString()} of {batch.found.toLocaleString()} photos are included.</p>}
+          {batch.error && <p className="import-card__detail import-batch__error">{batch.error}</p>}
+        </div>
+        <div className="import-card__actions">
+          {active && <button className="import-icon-button" disabled={busy} onClick={() => onControl("pause")} aria-label={`Pause ${batch.title}`}><Pause size={16} /></button>}
+          {batch.state === "paused" && <button className="import-icon-button" disabled={busy} onClick={() => onControl("resume")} aria-label={`Resume ${batch.title}`}><Play size={16} /></button>}
+          {(active || batch.state === "paused") && <button className="import-icon-button" disabled={busy} onClick={() => onControl("cancel")} aria-label={`Cancel ${batch.title}`}><X size={16} /></button>}
+          {!active && <button className="import-icon-button" disabled={busy} onClick={() => onControl("dismiss")} aria-label={`Remove ${batch.title} from the list`}><Trash size={16} /></button>}
+        </div>
+      </div>
+      {batch.state !== "done" && batch.state !== "cancelled" && <div className="import-batch__track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><div className="import-batch__bar" style={{ width: `${percent}%` }} /></div>}
+    </article>
+  );
 }
 
 // Review shortcuts. Each one clicks the button that has the same data-shortcut value, so a
@@ -222,13 +267,16 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
   const [googleStep, setGoogleStep] = useState("");
   const [albumLink, setAlbumLink] = useState("");
   const [skipped, setSkipped] = useState([]);
+  const [batches, setBatches] = useState([]);
+  const [batchBusyId, setBatchBusyId] = useState(null);
 
   useEffect(() => {
     api(CONFIG_API).then(setSetup).catch((requestError) => setSetup({ ready: false, error: requestError.message }));
     api(`${GOOGLE_API}/status`).then(setGooglePhotos).catch(() => setGooglePhotos(null));
+    api(BATCH_API).then(setBatches).catch(() => {});
     api(API)
       .then((storedJobs) => {
-        const visibleJobs = storedJobs.filter((job) => job.status !== "complete" && job.stages?.crop?.status !== "rejected" && job.stages?.garment?.status !== "rejected" && job.stages?.modeled?.status !== "rejected");
+        const visibleJobs = storedJobs.filter(visibleJob);
         setJobs(visibleJobs);
         setDrafts(Object.fromEntries(visibleJobs.map((job) => [job.id, defaultDraft(job)])));
       })
@@ -248,6 +296,36 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     const timer = setInterval(() => jobs.forEach((job) => refresh(job.id)), 900);
     return () => clearInterval(timer);
   }, [jobs, refresh]);
+
+  // While a big import runs on the server, follow its progress and pick up the items it queues.
+  const batchActive = batches.some((batch) => ACTIVE_BATCH.has(batch.state));
+  useEffect(() => {
+    if (!batchActive) return undefined;
+    const timer = setInterval(async () => {
+      try {
+        setBatches(await api(BATCH_API));
+        const storedJobs = (await api(API)).filter(visibleJob);
+        setJobs((current) => {
+          const known = new Set(current.map((job) => job.id));
+          const added = storedJobs.filter((job) => !known.has(job.id));
+          return added.length ? [...current, ...added] : current;
+        });
+        setDrafts((current) => ({ ...Object.fromEntries(storedJobs.filter((job) => !current[job.id]).map((job) => [job.id, defaultDraft(job)])), ...current }));
+      } catch { /* try again on the next tick */ }
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [batchActive]);
+
+  const addBatch = useCallback((batch) => setBatches((current) => [batch, ...current.filter((item) => item.id !== batch.id)]), []);
+
+  const controlBatch = async (batch, action) => {
+    setBatchBusyId(batch.id); setError("");
+    try {
+      const result = action === "dismiss" ? await api(`${BATCH_API}/${batch.id}`, { method: "DELETE" }) : await api(`${BATCH_API}/${batch.id}/${action}`, { method: "POST" });
+      setBatches((current) => action === "dismiss" ? current.filter((item) => item.id !== batch.id) : current.map((item) => item.id === batch.id ? result : item));
+    } catch (requestError) { setError(requestError.message); }
+    finally { setBatchBusyId(null); }
+  };
 
   const submitFiles = useCallback(async (files) => {
     if (!setup?.ready) { setOpen(true); return; }
@@ -271,33 +349,21 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     }
   }, [setup]);
 
-  const addGoogleResult = useCallback((result) => {
-    const createdJobs = result.jobs || [];
-    setJobs((currentJobs) => [...currentJobs, ...createdJobs]);
-    setDrafts((currentDrafts) => ({ ...currentDrafts, ...Object.fromEntries(createdJobs.map((job) => [job.id, defaultDraft(job)])) }));
-    if (result.skipped?.length) setSkipped((current) => [...current, ...result.skipped]);
-    const failed = (result.photos || []).filter((photo) => photo.error);
-    if (failed.length) setError(`${failed.length} ${failed.length === 1 ? "photo" : "photos"} could not be imported: ${failed.map((photo) => `${photo.filename} (${photo.error})`).join("; ")}`);
-    if (!createdJobs.length && !failed.length && !result.skipped?.length) setNotice({ tone: "complete", text: "No clothing detected", detail: "We couldn’t find a distinct wearable item in those photos. Try clearer or more tightly framed photos." });
-  }, []);
-
   const importAlbum = useCallback(async () => {
     if (!setup?.ready) { setOpen(true); return; }
     const link = albumLink.trim();
     if (!link) return;
     setError(""); setNotice(null); setSkipped([]); setOpen(true);
-    setGoogleStep("Finding clothes in your album");
+    setGoogleStep("Reading the album");
     try {
-      const result = await api(`${GOOGLE_API}/album`, { method: "POST", body: JSON.stringify({ url: link }) });
-      addGoogleResult(result);
+      addBatch(await api(BATCH_API, { method: "POST", body: JSON.stringify({ url: link }) }));
       setAlbumLink("");
-      if (result.found > result.limit) setNotice((current) => current || { tone: "complete", text: `Imported the first ${result.limit} photos`, detail: `The album has ${result.found} photos. Put the rest in a smaller album to import them.` });
     } catch (requestError) {
       setError(requestError.message);
     } finally {
       setGoogleStep("");
     }
-  }, [setup, albumLink, addGoogleResult]);
+  }, [setup, albumLink, addBatch]);
 
   const importFromGooglePhotos = useCallback(async () => {
     if (!setup?.ready) { setOpen(true); return; }
@@ -332,10 +398,10 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
         }
       }
       if (!popup.closed) popup.close();
-      setGoogleStep("Finding clothes in your photos");
-      const result = await api(`${GOOGLE_API}/sessions/${sessionId}/import`, { method: "POST" });
+      setGoogleStep("Starting the import");
+      const batch = await api(`${GOOGLE_API}/sessions/${sessionId}/import`, { method: "POST" });
       sessionId = null;
-      addGoogleResult(result);
+      addBatch(batch);
     } catch (requestError) {
       setError(requestError.message);
       if (popup && !popup.closed) popup.close();
@@ -344,7 +410,7 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     } finally {
       setGoogleStep("");
     }
-  }, [setup, addGoogleResult]);
+  }, [setup, addBatch]);
 
   useEffect(() => {
     let depth = 0;
@@ -462,13 +528,14 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
 
   const active = jobs[jobs.length - 1];
   const setupRequired = setup?.ready === false;
-  const activeStatus = setupRequired ? { tone: "error", text: "Setup required" } : googleStep ? { tone: "processing", text: googleStep } : active ? deriveStatus(active) : notice;
+  const runningBatch = batches.find((batch) => ACTIVE_BATCH.has(batch.state));
+  const activeStatus = setupRequired ? { tone: "error", text: "Setup required" } : googleStep ? { tone: "processing", text: googleStep } : active ? deriveStatus(active) : runningBatch ? { tone: "processing", text: `${runningBatch.title}: ${batchProgress(runningBatch).toLocaleString()} of ${runningBatch.total.toLocaleString()}` } : notice;
   const readyCount = jobs.filter((job) => deriveStatus(job).tone === "ready").length;
   const selectedReviewJob = jobs.find((job) => job.id === selectedReviewId && (reviewStageFor(job) || hasCleanupFailure(job)));
   const reviewJob = selectedReviewJob || jobs.find((job) => reviewStageFor(job)) || jobs.find((job) => hasCleanupFailure(job)) || active;
   const reviewStage = reviewJob ? reviewStageFor(reviewJob) : null;
   const progress = 0;
-  const hasImportActivity = Boolean(jobs.length || notice || setupRequired || googleStep);
+  const hasImportActivity = Boolean(jobs.length || notice || setupRequired || googleStep || batches.length);
   const albumForm = (
     <form className="import-album-form" onSubmit={(event) => { event.preventDefault(); importAlbum(); }}>
       <input type="url" inputMode="url" aria-label="Google Photos album link" placeholder="Paste a Google Photos album link" value={albumLink} disabled={!setup?.ready || Boolean(googleStep)} onChange={(event) => setAlbumLink(event.target.value)} />
@@ -492,6 +559,7 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
       <div className="import-popover-backdrop" data-open={open} onMouseDown={(event) => event.target === event.currentTarget && setOpen(false)}>
         <section ref={popoverRef} className="import-popover" role="dialog" aria-modal="true" aria-labelledby="import-title">
           <header className="import-popover__header"><div><p className="import-popover__eyebrow">Wardrobe import</p><h2 className="import-popover__title" id="import-title">{readyCount ? `${readyCount} ready for review` : activeStatus?.tone === "error" ? "Import needs attention" : jobs.length ? "Preparing new pieces" : notice?.text || "Add to your wardrobe"}</h2></div><button className="import-icon-button" type="button" onClick={() => setOpen(false)} aria-label="Close import progress"><X size={20} /></button></header>
+          {batches.length > 0 && <div className="import-batch-list">{batches.map((batch) => <BatchCard key={batch.id} batch={batch} busy={batchBusyId === batch.id} onControl={(action) => controlBatch(batch, action)} />)}</div>}
           {!jobs.length ? setupRequired ? <div className="import-drop-target import-setup-warning"><WarningCircle size={30} /><h2>Setup required</h2><p>Add your OpenAI API key to <code>.env</code> and a PNG reference photo of yourself at <code>{setup.modelReference || "data/model-reference.png"}</code>, then restart the app.</p></div> : <div className="import-drop-target"><UploadSimple size={28} /><h2>{notice ? "Try another image" : "Choose or paste an image"}</h2><p>{notice?.detail || "We’ll isolate each clothing item, suggest its details, and hold everything for your approval."}</p><div className="import-actions"><button className="import-button import-button--primary" disabled={!setup?.ready} onClick={() => { setNotice(null); inputRef.current?.click(); }}>Choose images</button>{googleButton}</div>{albumForm}</div> : (
             <>
               <div className={`import-progress${activeStatus?.tone !== "processing" ? " is-reviewing" : progress < 100 ? " is-indeterminate" : ""}`}><div className="import-progress__meta"><span>{activeStatus?.text}</span><span>{jobs.length} {jobs.length === 1 ? "item" : "items"}</span></div>{activeStatus?.tone === "processing" && <div className="import-progress__track"><div className="import-progress__bar" style={{ "--import-progress": `${progress}%` }} /></div>}</div>
