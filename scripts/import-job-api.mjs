@@ -376,6 +376,8 @@ export function wardrobeImportApi(options = {}) {
   let libraryAssetDir;
   const running = new Map();
   const setting = (name, fallback = "") => options.env?.[name] || process.env[name] || fallback;
+  const dataDirSetting = () => setting("WARDROBE_DATA_DIR", setting("RAILWAY_VOLUME_MOUNT_PATH", "data"));
+  const modelReferencePath = () => path.resolve(root, setting("WARDROBE_MODEL_REFERENCE") || path.join(dataDirSetting(), "model-reference.png"));
   const apiBaseUrl = () => setting("OPENAI_API_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, "");
   const googlePhotos = createGooglePhotosClient({
     clientId: () => setting("GOOGLE_CLIENT_ID").trim(),
@@ -495,10 +497,27 @@ export function wardrobeImportApi(options = {}) {
     return json(res, 404, { error: "Not found" });
   }
 
+  // Hosts such as Railway have no easy way to copy a file onto the server, so the photo can come from a URL.
+  async function downloadModelReference() {
+    const source = setting("WARDROBE_MODEL_REFERENCE_URL").trim();
+    const target = modelReferencePath();
+    if (!source || await stat(target).then(() => true, () => false)) return;
+    try {
+      const response = await fetch(source);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const bytes = Buffer.from(await response.arrayBuffer());
+      if (!bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) throw new Error("the file is not a PNG");
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, bytes);
+    } catch (error) {
+      console.warn(`[wardrobe] Could not download WARDROBE_MODEL_REFERENCE_URL: ${error.message}`);
+    }
+  }
+
   async function setupStatus() {
     const hasApiKey = Boolean(setting("OPENAI_API_KEY").trim());
-    const referenceSetting = setting("WARDROBE_MODEL_REFERENCE", "data/model-reference.png");
-    const referencePath = path.resolve(root, referenceSetting);
+    const referencePath = modelReferencePath();
+    const referenceSetting = path.relative(root, referencePath).startsWith("..") ? referencePath : path.relative(root, referencePath);
     let hasModelReference = false;
     try {
       hasModelReference = (await stat(referencePath)).isFile();
@@ -599,12 +618,12 @@ export function wardrobeImportApi(options = {}) {
             : `garment-${current.stages.garment.attempts}.png`;
           const garmentFile = path.join(dir, garmentName);
           const garment = { data: await readFile(garmentFile), mime: "image/png", name: "garment.png" };
-          const modelPath = path.resolve(root, setting("WARDROBE_MODEL_REFERENCE", "data/model-reference.png"));
+          const modelPath = modelReferencePath();
           let modelData;
           try {
             modelData = await readFile(modelPath);
           } catch (error) {
-            if (error.code === "ENOENT") throw new Error(`Model reference not found at ${modelPath}. Set WARDROBE_MODEL_REFERENCE or add data/model-reference.png.`);
+            if (error.code === "ENOENT") throw new Error(`Model reference not found at ${modelPath}. Set WARDROBE_MODEL_REFERENCE or WARDROBE_MODEL_REFERENCE_URL.`);
             throw error;
           }
           const model = { data: modelData, mime: "image/png", name: "model.png" };
@@ -789,12 +808,13 @@ export function wardrobeImportApi(options = {}) {
     apply: "serve",
     async configResolved(config) {
       root = config.root;
-      dataDir = path.resolve(root, setting("WARDROBE_DATA_DIR", "data"));
+      dataDir = path.resolve(root, dataDirSetting());
       jobsDir = path.join(dataDir, "jobs");
       importedFile = path.join(dataDir, "library.json");
       libraryAssetDir = path.join(dataDir, "imported");
       await mkdir(jobsDir, { recursive: true });
       await mkdir(libraryAssetDir, { recursive: true });
+      await downloadModelReference();
       const ids = await readdir(jobsDir).catch(() => []);
       for (const id of ids) {
         const job = await loadJob(id);
