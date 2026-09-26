@@ -237,6 +237,14 @@
 
 .import-editor { display: grid; grid-template-columns: minmax(140px, 0.8fr) minmax(0, 1.2fr); gap: 20px; }
 .import-editor__preview { width: 100%; max-height: 360px; object-fit: contain; background: var(--import-ivory); border-radius: 16px; }
+.import-crop-frame { position: relative; justify-self: center; align-self: start; width: fit-content; max-width: 100%; overflow: hidden; border-radius: 16px; background: var(--import-ivory); cursor: crosshair; touch-action: none; user-select: none; }
+.import-crop-frame[data-disabled="true"] { cursor: progress; }
+.import-editor--crop { grid-template-columns: minmax(0, 1.3fr) minmax(200px, 0.7fr); }
+.import-crop-frame img { display: block; max-width: 100%; max-height: 460px; pointer-events: none; }
+.import-crop-box { position: absolute; border: 2px solid var(--import-paper); outline: 1px solid var(--import-ink); box-shadow: 0 0 0 9999px rgba(36, 35, 31, 0.45); pointer-events: none; }
+.import-crop-result { display: grid; gap: 6px; justify-items: start; margin: 12px 0 0; }
+.import-crop-result img { max-width: 100%; max-height: 120px; object-fit: contain; border-radius: 10px; background: var(--import-ivory); }
+.import-crop-result figcaption { color: var(--import-muted); font-size: 11px; }
 .import-cleanup-editor { display: grid; gap: 14px; }
 .import-cleanup-editor > .import-card__detail { max-width: 680px; line-height: 1.45; }
 .import-cleanup-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
@@ -291,7 +299,7 @@
   .import-cleanup-editor + .import-card-list { margin-top: 22px; }
   .import-card-list + .import-actions { margin-top: 22px; }
   .import-editor { grid-template-columns: 1fr; }
-  .import-editor__preview { max-height: 240px; }
+  .import-editor__preview, .import-crop-frame img { max-height: 240px; }
 }
 
 @media (hover: none) and (pointer: coarse) {
