@@ -84,6 +84,11 @@ function defaultDraft(job) {
   };
 }
 
+// Review shortcuts. Each one clicks the button that has the same data-shortcut value, so a
+// key does exactly what a click does and is ignored while that button is disabled.
+const SHORTCUTS = { Enter: "approve", a: "approve", x: "reject", r: "regenerate", z: "undo" };
+const isTyping = (target) => Boolean(target?.closest?.("input, textarea, select, [contenteditable='true']"));
+
 const MIN_CROP_SIZE = 20;
 const sameBox = (a, b) => ["x", "y", "width", "height"].every((key) => a?.[key] === b?.[key]);
 
@@ -158,10 +163,10 @@ function ReviewEditor({ job, stage, draft, setDraft, regenPrompt, setRegenPrompt
           <textarea id={`regenerate-${job.id}-${stage}`} rows="3" value={regenPrompt} onChange={(event) => setRegenPrompt(event.target.value)} placeholder={isGarment ? "Example: preserve the original zipper and remove the retail tag" : "Example: use a quiet evening street and show the full garment"} />
         </div>}
         <div className="import-actions">
-          <button className="import-button" disabled={busy} onClick={() => onAction("reject")}><Trash size={14} /> Reject</button>
-          {!isCrop && <button className="import-button" disabled={busy} onClick={() => onAction("regenerate", regenPrompt)}><ArrowCounterClockwise size={14} /> Regenerate</button>}
-          {cropChanged && <button className="import-button" disabled={busy} onClick={() => setCropBox(savedBox)}><ArrowCounterClockwise size={14} /> Undo box</button>}
-          {cropChanged ? <button className="import-button import-button--primary" disabled={busy} onClick={() => onCrop(cropBox)}><Check size={14} weight="bold" /> Update crop</button> : <button className="import-button import-button--primary" disabled={busy || (isGarment && (!draft.name.trim() || !primaryValid || !secondaryValid))} onClick={() => onAction("approve")}><Check size={14} weight="bold" /> {isCrop ? "Use crop" : "Approve"}</button>}
+          <button className="import-button" data-shortcut="reject" disabled={busy} onClick={() => onAction("reject")}><Trash size={14} /> Reject <kbd>X</kbd></button>
+          {!isCrop && <button className="import-button" data-shortcut="regenerate" disabled={busy} onClick={() => onAction("regenerate", regenPrompt)}><ArrowCounterClockwise size={14} /> Regenerate <kbd>R</kbd></button>}
+          {cropChanged && <button className="import-button" data-shortcut="undo" disabled={busy} onClick={() => setCropBox(savedBox)}><ArrowCounterClockwise size={14} /> Undo box <kbd>Z</kbd></button>}
+          {cropChanged ? <button className="import-button import-button--primary" data-shortcut="approve" disabled={busy} onClick={() => onCrop(cropBox)}><Check size={14} weight="bold" /> Update crop <kbd>↵</kbd></button> : <button className="import-button import-button--primary" data-shortcut="approve" disabled={busy || (isGarment && (!draft.name.trim() || !primaryValid || !secondaryValid))} onClick={() => onAction("approve")}><Check size={14} weight="bold" /> {isCrop ? "Use crop" : "Approve"} <kbd>↵</kbd></button>}
         </div>
       </div>
     </div>
@@ -194,7 +199,7 @@ function CleanupEditor({ job, tolerance, setTolerance, busy, onPreview, onAccept
       {Number.isFinite(contaminated) && <p className="import-card__detail">The automated check sees {contaminated.toLocaleString()} tinted edge {contaminated === 1 ? "pixel" : "pixels"}. If the preview looks clean, you can still use it.</p>}
       <div className="import-actions">
         <button className="import-button" disabled={busy} onClick={() => onPreview(tolerance)}><ArrowCounterClockwise size={14} /> Preview cleanup</button>
-        <button className="import-button import-button--primary" disabled={busy} onClick={onAccept}><Check size={14} weight="bold" /> Use this cleanup</button>
+        <button className="import-button import-button--primary" data-shortcut="approve" disabled={busy} onClick={onAccept}><Check size={14} weight="bold" /> Use this cleanup <kbd>↵</kbd></button>
       </div>
     </div>
   );
@@ -216,6 +221,7 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
   const [googlePhotos, setGooglePhotos] = useState(null);
   const [googleStep, setGoogleStep] = useState("");
   const [albumLink, setAlbumLink] = useState("");
+  const [skipped, setSkipped] = useState([]);
 
   useEffect(() => {
     api(CONFIG_API).then(setSetup).catch((requestError) => setSetup({ ready: false, error: requestError.message }));
@@ -247,12 +253,13 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     if (!setup?.ready) { setOpen(true); return; }
     const images = [...files].filter((file) => file.type.startsWith("image/"));
     if (!images.length) return;
-    setDragging(false); setError(""); setNotice(null);
+    setDragging(false); setError(""); setNotice(null); setSkipped([]);
     for (const file of images) {
       try {
         const imageDataUrl = await fileToDataUrl(file);
         const result = await api(API, { method: "POST", body: JSON.stringify({ imageDataUrl, metadata: { name: file.name.replace(/\.[^.]+$/, "") } }) });
         const createdJobs = result.jobs || [result];
+        if (result.skipped?.length) { setSkipped((current) => [...current, ...result.skipped]); setOpen(true); }
         if (!createdJobs.length && result.noClothingDetected) {
           setNotice({ tone: "complete", text: "No clothing detected", detail: `We couldn’t find a distinct wearable item in ${file.name}. Try a clearer or more tightly framed image.` });
           setOpen(true);
@@ -268,16 +275,17 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     const createdJobs = result.jobs || [];
     setJobs((currentJobs) => [...currentJobs, ...createdJobs]);
     setDrafts((currentDrafts) => ({ ...currentDrafts, ...Object.fromEntries(createdJobs.map((job) => [job.id, defaultDraft(job)])) }));
+    if (result.skipped?.length) setSkipped((current) => [...current, ...result.skipped]);
     const failed = (result.photos || []).filter((photo) => photo.error);
     if (failed.length) setError(`${failed.length} ${failed.length === 1 ? "photo" : "photos"} could not be imported: ${failed.map((photo) => `${photo.filename} (${photo.error})`).join("; ")}`);
-    if (!createdJobs.length && !failed.length) setNotice({ tone: "complete", text: "No clothing detected", detail: "We couldn’t find a distinct wearable item in those photos. Try clearer or more tightly framed photos." });
+    if (!createdJobs.length && !failed.length && !result.skipped?.length) setNotice({ tone: "complete", text: "No clothing detected", detail: "We couldn’t find a distinct wearable item in those photos. Try clearer or more tightly framed photos." });
   }, []);
 
   const importAlbum = useCallback(async () => {
     if (!setup?.ready) { setOpen(true); return; }
     const link = albumLink.trim();
     if (!link) return;
-    setError(""); setNotice(null); setOpen(true);
+    setError(""); setNotice(null); setSkipped([]); setOpen(true);
     setGoogleStep("Finding clothes in your album");
     try {
       const result = await api(`${GOOGLE_API}/album`, { method: "POST", body: JSON.stringify({ url: link }) });
@@ -295,7 +303,7 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     if (!setup?.ready) { setOpen(true); return; }
     // Open the window now, while the click still counts as a user gesture, so pop-up blockers allow it.
     const popup = window.open("", "wardrobe-google-photos", "popup,width=1040,height=780");
-    setError(""); setNotice(null); setOpen(true);
+    setError(""); setNotice(null); setSkipped([]); setOpen(true);
     let sessionId = null;
     try {
       if (!popup) throw new Error("Allow pop-ups for this site to import from Google Photos.");
@@ -411,6 +419,47 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
     finally { setBusyId(null); }
   };
 
+  const popoverRef = useRef(null);
+  const reviewableIds = jobs.filter((job) => reviewStageFor(job) || hasCleanupFailure(job)).map((job) => job.id);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (!open) {
+        // "i" opens the import panel, unless an item viewer is open or the user is typing.
+        if (event.key.toLowerCase() === "i" && !isTyping(event.target) && !document.body.classList.contains("viewer-open")) { event.preventDefault(); setOpen(true); }
+        return;
+      }
+      if (isTyping(event.target)) {
+        if (event.key === "Escape") { event.preventDefault(); event.target.blur(); }
+        return;
+      }
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+      if (key === "Escape") {
+        event.preventDefault();
+        const undo = popoverRef.current?.querySelector('[data-shortcut="undo"]:not(:disabled)');
+        if (undo) undo.click(); else setOpen(false);
+        return;
+      }
+      if (["j", "k", "ArrowRight", "ArrowLeft", "ArrowDown", "ArrowUp"].includes(key)) {
+        if (!reviewableIds.length) return;
+        event.preventDefault();
+        const step = ["j", "ArrowRight", "ArrowDown"].includes(key) ? 1 : -1;
+        const current = reviewableIds.indexOf(reviewJob?.id);
+        setSelectedReviewId(reviewableIds[(current + step + reviewableIds.length) % reviewableIds.length]);
+        return;
+      }
+      const action = SHORTCUTS[key];
+      if (!action || (key === "Enter" && event.target?.closest?.("button, a"))) return;
+      const button = popoverRef.current?.querySelector(`.import-editor [data-shortcut="${action}"], .import-cleanup-editor [data-shortcut="${action}"]`);
+      if (!button || button.disabled) return;
+      event.preventDefault();
+      button.click();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   const active = jobs[jobs.length - 1];
   const setupRequired = setup?.ready === false;
   const activeStatus = setupRequired ? { tone: "error", text: "Setup required" } : googleStep ? { tone: "processing", text: googleStep } : active ? deriveStatus(active) : notice;
@@ -441,16 +490,18 @@ export function WardrobeImportFlow({ onGarmentApproved, onModeledApproved }) {
         <div className="import-tray__actions">{active && <img className="import-tray__preview" src={active.stages?.garment?.assetUrl || active.stages?.garment?.failedAssetUrl || active.stages?.crop?.assetUrl || active.originalAssetUrl} alt="" />}<span className="import-tray__label">{activeStatus?.text || "Add clothes"}</span>{!setupRequired && <button className="import-icon-button" type="button" onClick={() => inputRef.current?.click()} aria-label="Choose images"><UploadSimple size={17} /></button>}{!setupRequired && <button className="import-icon-button" type="button" onClick={() => setOpen(true)} aria-label="Import from Google Photos"><GooglePhotosLogo size={17} /></button>}</div>
       </aside>
       <div className="import-popover-backdrop" data-open={open} onMouseDown={(event) => event.target === event.currentTarget && setOpen(false)}>
-        <section className="import-popover" role="dialog" aria-modal="true" aria-labelledby="import-title">
+        <section ref={popoverRef} className="import-popover" role="dialog" aria-modal="true" aria-labelledby="import-title">
           <header className="import-popover__header"><div><p className="import-popover__eyebrow">Wardrobe import</p><h2 className="import-popover__title" id="import-title">{readyCount ? `${readyCount} ready for review` : activeStatus?.tone === "error" ? "Import needs attention" : jobs.length ? "Preparing new pieces" : notice?.text || "Add to your wardrobe"}</h2></div><button className="import-icon-button" type="button" onClick={() => setOpen(false)} aria-label="Close import progress"><X size={20} /></button></header>
           {!jobs.length ? setupRequired ? <div className="import-drop-target import-setup-warning"><WarningCircle size={30} /><h2>Setup required</h2><p>Add your OpenAI API key to <code>.env</code> and a PNG reference photo of yourself at <code>{setup.modelReference || "data/model-reference.png"}</code>, then restart the app.</p></div> : <div className="import-drop-target"><UploadSimple size={28} /><h2>{notice ? "Try another image" : "Choose or paste an image"}</h2><p>{notice?.detail || "We’ll isolate each clothing item, suggest its details, and hold everything for your approval."}</p><div className="import-actions"><button className="import-button import-button--primary" disabled={!setup?.ready} onClick={() => { setNotice(null); inputRef.current?.click(); }}>Choose images</button>{googleButton}</div>{albumForm}</div> : (
             <>
               <div className={`import-progress${activeStatus?.tone !== "processing" ? " is-reviewing" : progress < 100 ? " is-indeterminate" : ""}`}><div className="import-progress__meta"><span>{activeStatus?.text}</span><span>{jobs.length} {jobs.length === 1 ? "item" : "items"}</span></div>{activeStatus?.tone === "processing" && <div className="import-progress__track"><div className="import-progress__bar" style={{ "--import-progress": `${progress}%` }} /></div>}</div>
               {reviewJob && reviewStage ? <ReviewEditor key={`${reviewJob.id}:${reviewStage}`} onCrop={(boundingBox) => updateCrop(reviewJob, boundingBox)} job={reviewJob} stage={reviewStage} draft={drafts[reviewJob.id] || defaultDraft(reviewJob)} setDraft={(draft) => setDrafts((current) => ({ ...current, [reviewJob.id]: draft }))} regenPrompt={regenerationPrompts[`${reviewJob.id}:${reviewStage}`] || ""} setRegenPrompt={(prompt) => setRegenerationPrompts((current) => ({ ...current, [`${reviewJob.id}:${reviewStage}`]: prompt }))} busy={busyId === reviewJob.id} onAction={(action, prompt) => perform(reviewJob, reviewStage, action, prompt)} /> : reviewJob && hasCleanupFailure(reviewJob) ? <CleanupEditor job={reviewJob} tolerance={cleanupTolerances[reviewJob.id] ?? reviewJob.stages.garment.cleanupTolerance ?? 46} setTolerance={(tolerance) => setCleanupTolerances((current) => ({ ...current, [reviewJob.id]: tolerance }))} busy={busyId === reviewJob.id} onPreview={(tolerance) => performCleanup(reviewJob, "preview", tolerance)} onAccept={() => performCleanup(reviewJob, "accept")} /> : null}
               <div className="import-card-list">{jobs.map((job) => { const status = deriveStatus(job); const itemName = drafts[job.id]?.name || job.metadata?.name || "New piece"; const failedStage = job.stages?.garment?.status === "failed" ? "garment" : job.stages?.modeled?.status === "failed" ? "modeled" : null; return <article className={`import-card is-${status.tone}${reviewJob?.id === job.id ? " is-selected" : ""}`} key={job.id}><img className="import-card__image" src={job.stages?.garment?.assetUrl || job.stages?.garment?.failedAssetUrl || job.stages?.crop?.assetUrl || job.originalAssetUrl} alt="" /><div className="import-card__body"><h3 className="import-card__title">{itemName}</h3><p className="import-card__detail import-card__detail--status" data-tone={status.tone}>{status.tone === "error" ? status.detail : status.text}</p></div><div className="import-card__actions">{status.tone === "ready" && <button className="import-icon-button" onClick={() => { setSelectedReviewId(job.id); setOpen(true); }} aria-label={`Review ${itemName}`}><Check size={17} /></button>}{failedStage && <button className="import-button import-card__retry" disabled={busyId === job.id} onClick={() => perform(job, failedStage, "regenerate", "")}><ArrowCounterClockwise size={14} /> Retry</button>}<button className="import-icon-button import-card__delete" disabled={busyId === job.id} onClick={() => deleteJob(job)} aria-label={`Delete ${itemName} from import queue`}><Trash size={16} /></button></div></article>; })}</div>
+              <p className="import-shortcuts" aria-label="Keyboard shortcuts"><span><kbd>↵</kbd> approve</span><span><kbd>X</kbd> reject</span><span><kbd>R</kbd> regenerate</span><span><kbd>J</kbd><kbd>K</kbd> next and previous item</span><span><kbd>Esc</kbd> undo box or close</span></p>
               {albumForm}<div className="import-actions">{googleButton}<button className="import-button" onClick={() => inputRef.current?.click()}><Plus size={14} /> Add another</button></div>
             </>
           )}
+          {skipped.length > 0 && <p className="import-status is-complete" role="status">Skipped {skipped.length} {skipped.length === 1 ? "item" : "items"} you already have: {skipped.map((item) => `${item.name} (same as ${item.matches})`).join(", ")}.</p>}
           {error && <p className="import-status is-error" role="alert">{error}</p>}
         </section>
       </div>

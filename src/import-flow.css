@@ -194,6 +194,12 @@
 .import-status.is-processing::before { animation: import-pulse 1.2s ease-in-out infinite; }
 .import-status.is-complete { color: #49604b; }
 .import-status.is-error { color: #8a3f35; }
+.import-status + .import-status { margin-top: 8px; }
+.import-shortcuts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 18px 0 0; color: var(--import-muted); font-size: 11px; }
+.import-shortcuts span { display: inline-flex; align-items: center; gap: 4px; }
+.import-popover kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--import-line); border-bottom-width: 2px; border-radius: 5px; font: 500 10px/1 "Instrument Sans", sans-serif; color: inherit; opacity: 0.75; }
+.import-button--primary kbd { border-color: rgba(255, 255, 255, 0.35); }
+@media (hover: none) and (pointer: coarse) { .import-popover kbd, .import-shortcuts { display: none; } }
 
 .import-card-list { display: grid; gap: 10px; }
 .import-editor__stage {
