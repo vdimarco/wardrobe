@@ -19,7 +19,7 @@ export default defineConfig(({ mode }) => {
     preview: {
       host: "0.0.0.0",
       port: 4173,
-      allowedHosts: ["localhost", "healthcheck.railway.app", "wardrobe.uptick.fyi"],
+      allowedHosts: ["localhost", "healthcheck.railway.app", ".up.railway.app", "wardrobe.uptick.fyi", env.RAILWAY_PUBLIC_DOMAIN].filter(Boolean),
     },
     plugins: [react(), responsiveImageApi(), wardrobeImportApi({ env })],
   };

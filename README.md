@@ -83,11 +83,26 @@ A **Google Photos** button then shows in the import panel. The first time you us
 | `OPENAI_VISION_MODEL` | `gpt-5.4-mini` |
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` |
 | `OPENAI_IMAGE_QUALITY` | `high` |
-| `WARDROBE_MODEL_REFERENCE` | `data/model-reference.png` |
-| `WARDROBE_DATA_DIR` | `data` |
+| `WARDROBE_MODEL_REFERENCE` | `<data dir>/model-reference.png` |
+| `WARDROBE_MODEL_REFERENCE_URL` | Optional. A PNG to download when the model reference file is missing |
+| `WARDROBE_DATA_DIR` | `RAILWAY_VOLUME_MOUNT_PATH` if set, else `data` |
 | `GOOGLE_CLIENT_ID` | Optional, for Google Photos |
 | `GOOGLE_CLIENT_SECRET` | Optional, for Google Photos |
 | `GOOGLE_PHOTOS_REDIRECT_URI` | `<app origin>/api/import/google-photos/callback` |
+
+## Deploy to Railway
+
+The repo has a `railway.json`. Railway builds the app with `npm run build` and starts it with `npm start`.
+
+1. Create a Railway service from this repo.
+2. Attach a volume to the service. Any mount path works, for example `/data`. The app keeps the library, the imported images, the import jobs and the Google Photos token on the volume. Without a volume, you lose them at each deploy.
+3. Set the variables in the service:
+   - `OPENAI_API_KEY`
+   - `WARDROBE_MODEL_REFERENCE_URL`: a link to a PNG photo of yourself. At startup, the app downloads it to the volume if the file is not there yet. To change the photo, delete `model-reference.png` from the volume and redeploy.
+4. Generate a public domain for the service. The app accepts `*.up.railway.app` and the domain in `RAILWAY_PUBLIC_DOMAIN`. For a custom domain, add it to `preview.allowedHosts` in `vite.config.mjs`.
+5. Optional, for the Google Photos picker: add `https://<your domain>/api/import/google-photos/callback` as a redirect URI on your OAuth client. Then set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Set `GOOGLE_PHOTOS_REDIRECT_URI` only if the app builds the wrong callback URL.
+
+The app has no login. Anyone who can open the URL can import clothes with your OpenAI key and use your Google Photos connection. Keep the URL private.
 
 ## License
 
