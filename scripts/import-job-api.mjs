@@ -347,26 +347,145 @@ async function openAIEdit({ key, baseUrl, model, prompt, images, size, backgroun
   return Buffer.from(encoded, "base64");
 }
 
-async function openAIAnalyze({ key, baseUrl, model, image, mime }) {
+const PART_LABELS = { upperbody: "top", wholebody_up: "jacket or outer layer", lowerbody: "bottoms", accessories_up: "accessory", shoes: "shoes" };
+const EDGE = { type: "integer", minimum: 0, maximum: 1000 };
+const EDGE_BOX_SCHEMA = { type: "object", additionalProperties: false, properties: { left: EDGE, top: EDGE, right: EDGE, bottom: EDGE }, required: ["left", "top", "right", "bottom"] };
+const BOX_INSTRUCTIONS = "Give each box as four integer edges on a 0-1000 scale, where 0 is the left or top edge of the image and 1000 is the right or bottom edge: left, top, right, bottom. Measure horizontal edges against the image width and vertical edges against the image height. Make the box tight, but include the complete item: every sleeve, collar, strap, hem, cuff, brim and sole. Do not include other garments or the background.";
+
+export function edgesToBoundingBox(edges = {}) {
+  const left = Math.min(Number(edges.left), Number(edges.right));
+  const right = Math.max(Number(edges.left), Number(edges.right));
+  const top = Math.min(Number(edges.top), Number(edges.bottom));
+  const bottom = Math.max(Number(edges.top), Number(edges.bottom));
+  return normalizeBoundingBox({ x: left, y: top, width: right - left, height: bottom - top });
+}
+
+// Vision requests use JPEG: the model scales every image to 2048px or less anyway,
+// and a JPEG keeps the request small. Boxes are relative, so the size does not matter.
+async function visionImage(bytes, maxSize = 2048) {
+  const data = await sharp(bytes).rotate().resize(maxSize, maxSize, { fit: "inside", withoutEnlargement: true }).jpeg({ quality: 90 }).toBuffer();
+  return `data:image/jpeg;base64,${data.toString("base64")}`;
+}
+
+async function openAIStructured({ key, baseUrl, model, text, images, name, schema }) {
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
       input: [{ role: "user", content: [
-        { type: "input_text", text: "Identify every distinct wearable clothing item visible in this image. A photo may show one isolated garment or a person wearing several items. Return one record per actual item that should enter a wardrobe. Ignore the person's body and non-wearable background objects. For each item, include a tight bounding box around only that item using integer coordinates normalized to a 1000 by 1000 image: x and y are the top-left corner, followed by width and height. Boxes may overlap when garments overlap, but each box must focus on one distinct item. Use only these category ids: upperbody, wholebody_up, lowerbody, accessories_up, shoes. Suggest a concise specific name, primary hex color, optional genuinely distinct secondary hex color, and 1-4 useful lowercase detail tags." },
-        { type: "input_image", image_url: `data:${mime};base64,${image.toString("base64")}` },
+        { type: "input_text", text },
+        ...images.map((imageUrl) => ({ type: "input_image", image_url: imageUrl, detail: "high" })),
       ] }],
-      text: { format: { type: "json_schema", name: "wardrobe_items", strict: true, schema: { type: "object", additionalProperties: false, properties: { items: { type: "array", minItems: 0, maxItems: 8, items: { type: "object", additionalProperties: false, properties: { name: { type: "string" }, part: { type: "string", enum: ["upperbody", "wholebody_up", "lowerbody", "accessories_up", "shoes"] }, color: { type: "string", pattern: "^#[0-9A-Fa-f]{6}$" }, secondaryColor: { anyOf: [{ type: "string", pattern: "^#[0-9A-Fa-f]{6}$" }, { type: "null" }] }, tags: { type: "array", items: { type: "string" }, maxItems: 4 }, boundingBox: { type: "object", additionalProperties: false, properties: { x: { type: "integer", minimum: 0, maximum: 999 }, y: { type: "integer", minimum: 0, maximum: 999 }, width: { type: "integer", minimum: 1, maximum: 1000 }, height: { type: "integer", minimum: 1, maximum: 1000 } }, required: ["x", "y", "width", "height"] } }, required: ["name", "part", "color", "secondaryColor", "tags", "boundingBox"] } } }, required: ["items"] } } },
+      text: { format: { type: "json_schema", name, strict: true, schema } },
     }),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.error?.message || `OpenAI analysis failed (${response.status})`);
   const outputText = result.output_text || result.output?.flatMap((item) => item.content || []).find((item) => item.type === "output_text")?.text;
   if (!outputText) throw new Error("OpenAI analysis returned no structured result");
-  const parsed = JSON.parse(outputText);
+  return JSON.parse(outputText);
+}
+
+const MIN_CONFIDENCE = 60;
+const WEARABLE_RULES = "An item counts only if it is a garment (top, shirt, jacket, coat, dress, trousers, shorts, skirt), footwear, or a fashion accessory (hat, cap, bag, belt, scarf, tie, sunglasses, watch, jewelry). Never return the ground, floor, sand, water, sky, walls, furniture, railings, tables, chairs, umbrellas, towels, curtains, flags, signs, food, skin or hair. Never return a part of a garment, such as a pocket, collar, sleeve, button, logo, print or pattern panel: a patterned shirt is one item.";
+
+const SHEET_TILE = 128;
+const SHEET_COLUMNS = 8;
+export const SHEET_MAX_ITEMS = 48;
+
+// One image with a numbered picture of every item the owner already has, so the vision
+// model can tell when a photo shows a piece that is already in the wardrobe or the queue.
+export async function buildOwnedSheet(files) {
+  const tiles = await Promise.all(files.map(async (file, index) => {
+    const picture = await sharp(file).rotate().resize(SHEET_TILE - 8, SHEET_TILE - 30, { fit: "contain", background: "#ffffff" }).flatten({ background: "#ffffff" }).png().toBuffer();
+    const label = Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${SHEET_TILE}" height="26"><rect width="100%" height="100%" fill="#ffffff"/><text x="6" y="19" font-family="sans-serif" font-size="18" font-weight="bold" fill="#111111">${index + 1}</text></svg>`);
+    const left = (index % SHEET_COLUMNS) * SHEET_TILE;
+    const top = Math.floor(index / SHEET_COLUMNS) * SHEET_TILE;
+    return [{ input: label, left, top }, { input: picture, left: left + 4, top: top + 26 }];
+  }));
+  const rows = Math.ceil(files.length / SHEET_COLUMNS);
+  const sheet = await sharp({ create: { width: Math.min(files.length, SHEET_COLUMNS) * SHEET_TILE, height: rows * SHEET_TILE, channels: 3, background: "#ffffff" } }).composite(tiles.flat()).jpeg({ quality: 85 }).toBuffer();
+  return `data:image/jpeg;base64,${sheet.toString("base64")}`;
+}
+
+async function openAIAnalyze({ key, baseUrl, model, image, ownerImage, owned = [], ownedSheet = null }) {
+  const ownerText = ownerImage
+    ? "Image 1 shows the wardrobe owner. The last image is the photo to import from. Find the owner in the last image by comparing face, hair and build with Image 1, and set ownerVisible. If the owner is visible, return only the items the owner wears or carries, and ignore every other person and everything they wear. If the owner is not visible, return only items that nobody wears, such as a flat lay, a hanger or a product photo."
+    : "Return the items worn or carried by the main person in the photo, or items that nobody wears, such as a flat lay, a hanger or a product photo. Ignore other people in the background. Set ownerVisible to true when a main person is visible.";
+  const images = [ownerImage, ownedSheet, await visionImage(image)].filter(Boolean);
+  const ownedText = ownedSheet
+    ? ` The image before the photo to import from is a sheet of ${owned.length} numbered items the owner already has: ${owned.map((item, index) => `${index + 1}. ${item.name} (${PART_LABELS[item.part] || "item"}, ${item.color})`).join("; ")}. For each item in the photo, set alreadyOwned to the number of the same physical piece on the sheet: same kind of item, same color and same details such as print, logo, collar and fit. Set alreadyOwned to null when it is a different piece or when you are not sure.`
+    : " Set alreadyOwned to null for every item.";
+  const parsed = await openAIStructured({
+    key, baseUrl, model, name: "wardrobe_items", images,
+    text: `${ownerText}${ownedText} ${WEARABLE_RULES} Return one record per complete item, and return fewer items when you are not sure. For each item, set wornBy to owner, nobody or other_person, and set confidence from 0 to 100 for how sure you are that it is a real wearable item that belongs in the owner's wardrobe. Include a bounding box around only that item in the photo to import from. ${BOX_INSTRUCTIONS} Boxes may overlap when garments overlap, but each box must focus on one distinct item. Use only these category ids: upperbody, wholebody_up, lowerbody, accessories_up, shoes. Suggest a concise specific name, primary hex color, optional genuinely distinct secondary hex color, and 1-4 useful lowercase detail tags.`,
+    schema: { type: "object", additionalProperties: false, properties: { ownerVisible: { type: "boolean" }, items: { type: "array", minItems: 0, maxItems: 8, items: { type: "object", additionalProperties: false, properties: { name: { type: "string" }, part: { type: "string", enum: ["upperbody", "wholebody_up", "lowerbody", "accessories_up", "shoes"] }, color: { type: "string", pattern: "^#[0-9A-Fa-f]{6}$" }, secondaryColor: { anyOf: [{ type: "string", pattern: "^#[0-9A-Fa-f]{6}$" }, { type: "null" }] }, tags: { type: "array", items: { type: "string" }, maxItems: 4 }, wornBy: { type: "string", enum: ["owner", "nobody", "other_person"] }, confidence: { type: "integer", minimum: 0, maximum: 100 }, alreadyOwned: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }, box: EDGE_BOX_SCHEMA }, required: ["name", "part", "color", "secondaryColor", "tags", "wornBy", "confidence", "alreadyOwned", "box"] } } }, required: ["ownerVisible", "items"] },
+  });
   if (!Array.isArray(parsed.items)) throw new Error("OpenAI analysis returned an invalid clothing list");
-  return parsed.items;
+  return selectOwnerItems(parsed);
+}
+
+// Keep confident items that belong to the owner. When the owner is in the photo, loose items
+// nearby (a bag on a chair, shoes on the floor) are more often someone else's, so drop them too.
+export function selectOwnerItems({ ownerVisible, items }) {
+  return items
+    .filter((item) => item.wornBy !== "other_person" && !(ownerVisible && item.wornBy !== "owner"))
+    .filter((item) => Number(item.confidence) >= MIN_CONFIDENCE)
+    .map(({ box, wornBy, ...item }) => ({ ...item, boundingBox: edgesToBoundingBox(box) }));
+}
+
+// Drop an item whose box sits mostly inside a bigger box of the same category, such as a
+// pocket or a pattern panel found as its own item inside the shirt it belongs to.
+export function removeNestedItems(items) {
+  const area = (box) => box.width * box.height;
+  const overlap = (a, b) => Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+  return items.filter((item, index) => !items.some((other, otherIndex) => otherIndex !== index
+    && other.part === item.part
+    && (area(other.boundingBox) > area(item.boundingBox) || (area(other.boundingBox) === area(item.boundingBox) && otherIndex < index))
+    && overlap(item.boundingBox, other.boundingBox) >= area(item.boundingBox) * 0.7));
+}
+
+// The first pass sees the whole photo, so its boxes are rough. Zoom into the area
+// around each rough box and ask again for a tight box, then map it back.
+export function refinementRegion(boundingBox, width, height) {
+  const box = normalizeBoundingBox(boundingBox);
+  const boxLeft = (box.x / 1000) * width;
+  const boxTop = (box.y / 1000) * height;
+  const boxWidth = (box.width / 1000) * width;
+  const boxHeight = (box.height / 1000) * height;
+  const margin = Math.round(Math.max(boxWidth, boxHeight) * 0.35) + 24;
+  const left = Math.max(0, Math.floor(boxLeft - margin));
+  const top = Math.max(0, Math.floor(boxTop - margin));
+  const right = Math.min(width, Math.ceil(boxLeft + boxWidth + margin));
+  const bottom = Math.min(height, Math.ceil(boxTop + boxHeight + margin));
+  return { left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+}
+
+export function regionBoxToImageBox(edges, region, width, height) {
+  const inner = edgesToBoundingBox(edges);
+  const toX = (value) => ((region.left + (value / 1000) * region.width) / width) * 1000;
+  const toY = (value) => ((region.top + (value / 1000) * region.height) / height) * 1000;
+  return edgesToBoundingBox({ left: toX(inner.x), top: toY(inner.y), right: toX(inner.x + inner.width), bottom: toY(inner.y + inner.height) });
+}
+
+// Returns the tight box, or null when the zoomed view shows that this is not a real
+// wearable item (for example the ground, a railing or a pattern on a shirt).
+async function refineBoundingBox({ key, baseUrl, model, image, metadata }) {
+  const { width, height } = await sharp(image).metadata();
+  const region = refinementRegion(metadata.boundingBox, width, height);
+  const zoomed = await sharp(image).extract(region).png().toBuffer();
+  const secondary = metadata.secondaryColor ? ` and ${metadata.secondaryColor}` : "";
+  const result = await openAIStructured({
+    key, baseUrl, model, images: [await visionImage(zoomed)], name: "item_box",
+    text: `This image is a zoomed-in part of a larger photo. Find the ${metadata.name} (${PART_LABELS[metadata.part] || "clothing item"}, mainly ${metadata.color}${secondary}). Set found to false if it is not visible. Set isWearableItem to true only if it is a complete garment, footwear or fashion accessory that a person wears or carries. ${WEARABLE_RULES} ${BOX_INSTRUCTIONS} If the item continues past an edge of this image, put the box on that edge.`,
+    schema: { type: "object", additionalProperties: false, properties: { found: { type: "boolean" }, isWearableItem: { type: "boolean" }, box: EDGE_BOX_SCHEMA }, required: ["found", "isWearableItem", "box"] },
+  });
+  if (!result.found || !result.isWearableItem) return null;
+  const refined = regionBoxToImageBox(result.box, region, width, height);
+  // A tiny box means the model latched onto a detail, such as a logo. Keep the rough box then.
+  const area = (box) => box.width * box.height;
+  return area(refined) < area(metadata.boundingBox) * 0.15 ? metadata.boundingBox : refined;
 }
 
 export function wardrobeImportApi(options = {}) {
@@ -407,7 +526,27 @@ export function wardrobeImportApi(options = {}) {
   async function createJobsFromImage(imageBytes) {
     const normalizedImage = await normalizeImage(imageBytes);
     const key = setting("OPENAI_API_KEY");
-    const detected = (await openAIAnalyze({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_VISION_MODEL", "gpt-5.4-mini"), image: normalizedImage, mime: "image/png" })).map(normalizeMetadata);
+    const model = setting("OPENAI_VISION_MODEL", "gpt-5.4-mini");
+    let ownerImage = null;
+    try { ownerImage = await visionImage(await readFile(modelReferencePath()), 1024); }
+    catch (error) { if (error.code !== "ENOENT") console.warn(`[wardrobe] Could not read the model reference photo: ${error.message}`); }
+    const owned = await ownedItems();
+    let ownedSheet = null;
+    try { if (owned.length) ownedSheet = await buildOwnedSheet(owned.map((item) => item.file)); }
+    catch (error) { console.warn(`[wardrobe] Could not build the owned items sheet: ${error.message}`); }
+    const found = await openAIAnalyze({ key, baseUrl: apiBaseUrl(), model, image: normalizedImage, ownerImage, owned: ownedSheet ? owned : [], ownedSheet });
+    const duplicateOf = (item) => ownedSheet && Number.isInteger(item.alreadyOwned) ? owned[item.alreadyOwned - 1] : null;
+    const skipped = found.filter(duplicateOf).map((item) => ({ name: item.name, matches: duplicateOf(item).name }));
+    const rough = found.filter((item) => !duplicateOf(item)).map(normalizeMetadata);
+    const refined = await Promise.all(rough.map(async (metadata) => {
+      try {
+        const boundingBox = await refineBoundingBox({ key, baseUrl: apiBaseUrl(), model, image: normalizedImage, metadata });
+        return boundingBox && { ...metadata, boundingBox };
+      } catch {
+        return metadata;
+      }
+    }));
+    const detected = removeNestedItems(refined.filter(Boolean));
     const jobs = [];
     for (const metadata of detected) {
       const id = randomUUID();
@@ -423,19 +562,37 @@ export function wardrobeImportApi(options = {}) {
       job.originalAssetUrl = `${ASSET_ROOT}/${id}/${originalFile}`;
       await saveJob(job); jobs.push(publicJob(job));
     }
-    return jobs;
+    return { jobs, skipped };
+  }
+
+  // Wardrobe items plus items still in the import queue, newest first, with a picture file each.
+  async function ownedItems() {
+    const library = (await loadImported()).map((record) => ({ name: record.name, part: record.part, color: record.color, file: path.join(libraryAssetDir, path.basename(String(record.image || ""))) }));
+    const ids = await readdir(jobsDir).catch(() => []);
+    const queued = (await Promise.all(ids.map((id) => loadJob(id).catch(() => null))))
+      .filter((job) => job && job.status === "active" && !["rejected"].includes(job.stages.crop?.status))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((job) => {
+        const garment = job.stages.garment?.assetUrl && path.basename(new URL(job.stages.garment.assetUrl, "http://localhost").pathname);
+        return { name: job.metadata?.name, part: job.metadata?.part, color: job.metadata?.color, file: path.join(jobsDir, job.id, garment || job.internal?.cropFile || "crop.png") };
+      });
+    const all = [...library, ...queued].reverse();
+    const present = await Promise.all(all.map((item) => stat(item.file).then((info) => info.isFile(), () => false)));
+    return all.filter((_, index) => present[index]).slice(0, SHEET_MAX_ITEMS);
   }
 
   async function importDownloadedPhotos(photos, download) {
-    const results = await mapLimit(photos, 3, async (photo) => {
+    // One photo at a time, so each photo is checked against the items the photos before it added.
+    const results = await mapLimit(photos, 1, async (photo) => {
       try {
-        return { filename: photo.filename, jobs: await createJobsFromImage(await download(photo)) };
+        return { filename: photo.filename, ...(await createJobsFromImage(await download(photo))) };
       } catch (error) {
-        return { filename: photo.filename, jobs: [], error: error.message };
+        return { filename: photo.filename, jobs: [], skipped: [], error: error.message };
       }
     });
     return {
       jobs: results.flatMap((result) => result.jobs),
+      skipped: results.flatMap((result) => result.skipped),
       photos: results.map(({ filename, jobs, error }) => ({ filename, items: jobs.length, error: error || null })),
     };
   }
@@ -710,8 +867,8 @@ export function wardrobeImportApi(options = {}) {
         await requireReady();
         const input = await body(req);
         const image = decodeImage(input);
-        const jobs = await createJobsFromImage(image.data);
-        return json(res, 202, { jobs, noClothingDetected: jobs.length === 0 });
+        const { jobs, skipped } = await createJobsFromImage(image.data);
+        return json(res, 202, { jobs, skipped, noClothingDetected: jobs.length === 0 && skipped.length === 0 });
       }
       if (url.pathname === API_ROOT && req.method === "GET") {
         const ids = await readdir(jobsDir).catch(() => []);
@@ -735,6 +892,20 @@ export function wardrobeImportApi(options = {}) {
         const input = await body(req);
         if (!input.metadata || typeof input.metadata !== "object" || Array.isArray(input.metadata)) throw Object.assign(new Error("metadata must be an object"), { status: 400 });
         job.metadata = normalizeMetadata({ ...job.metadata, ...input.metadata }); await saveJob(job);
+        return json(res, 200, publicJob(job));
+      }
+      if (action === "crop" && req.method === "POST") {
+        if (job.stages.crop?.status !== "review") throw Object.assign(new Error("The crop can only change before you approve it"), { status: 409 });
+        const input = await body(req);
+        const boundingBox = normalizeBoundingBox(input.boundingBox);
+        const original = await readFile(path.join(jobsDir, job.id, job.internal.originalFile));
+        const cropFile = `crop-${Date.now()}.png`;
+        await writeFile(path.join(jobsDir, job.id, cropFile), await cropDetectedItem(original, boundingBox));
+        job.metadata = { ...job.metadata, boundingBox };
+        job.internal.cropFile = cropFile;
+        job.stages.crop.assetUrl = `${ASSET_ROOT}/${job.id}/${cropFile}`;
+        job.stages.crop.updatedAt = new Date().toISOString();
+        await saveJob(job);
         return json(res, 200, publicJob(job));
       }
       const cleanupAction = action.match(/^stages\/garment\/(cleanup-preview|cleanup-accept)$/);
