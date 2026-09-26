@@ -84,6 +84,7 @@ A **Google Photos** button then shows in the import panel. The first time you us
 | `OPENAI_IMAGE_MODEL` | `gpt-image-2` |
 | `OPENAI_IMAGE_QUALITY` | `high` |
 | `WARDROBE_MODEL_REFERENCE` | `<data dir>/model-reference.png` |
+| `WARDROBE_MODEL_REFERENCES_DIR` | `<data dir>/model-references`. Up to 4 more photos of you (PNG, JPEG or WebP), sent with the main photo for modeled images |
 | `WARDROBE_MODEL_REFERENCE_URL` | Optional. A PNG to download when the model reference file is missing |
 | `WARDROBE_DATA_DIR` | `RAILWAY_VOLUME_MOUNT_PATH` if set, else `data` |
 | `GOOGLE_CLIENT_ID` | Optional, for Google Photos |

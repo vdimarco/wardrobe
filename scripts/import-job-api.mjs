@@ -5,6 +5,7 @@ import sharp from "sharp";
 import { GOOGLE_PHOTOS_MAX_ITEMS, createGooglePhotosClient, downloadSharedAlbumPhoto, fetchSharedAlbum } from "./google-photos.mjs";
 
 const API_ROOT = "/api/import/jobs";
+const MAX_EXTRA_REFERENCES = 4;
 const GOOGLE_ROOT = "/api/import/google-photos";
 const ASSET_ROOT = "/api/import/assets";
 const LIBRARY_ASSET_ROOT = "/api/import/library";
@@ -378,6 +379,7 @@ export function wardrobeImportApi(options = {}) {
   const setting = (name, fallback = "") => options.env?.[name] || process.env[name] || fallback;
   const dataDirSetting = () => setting("WARDROBE_DATA_DIR", setting("RAILWAY_VOLUME_MOUNT_PATH", "data"));
   const modelReferencePath = () => path.resolve(root, setting("WARDROBE_MODEL_REFERENCE") || path.join(dataDirSetting(), "model-reference.png"));
+  const extraReferencesDir = () => path.resolve(root, setting("WARDROBE_MODEL_REFERENCES_DIR") || path.join(dataDirSetting(), "model-references"));
   const apiBaseUrl = () => setting("OPENAI_API_BASE_URL", "https://api.openai.com/v1").replace(/\/$/, "");
   const googlePhotos = createGooglePhotosClient({
     clientId: () => setting("GOOGLE_CLIENT_ID").trim(),
@@ -514,6 +516,16 @@ export function wardrobeImportApi(options = {}) {
     }
   }
 
+  // Extra photos of the same person help the image model keep their likeness.
+  async function loadExtraReferences() {
+    const dir = extraReferencesDir();
+    const names = (await readdir(dir).catch(() => []))
+      .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
+      .sort()
+      .slice(0, MAX_EXTRA_REFERENCES);
+    return Promise.all(names.map(async (name, index) => ({ data: await readFile(path.join(dir, name)), mime: "image/png", name: `model-${index + 2}.png` })));
+  }
+
   async function setupStatus() {
     const hasApiKey = Boolean(setting("OPENAI_API_KEY").trim());
     const referencePath = modelReferencePath();
@@ -626,9 +638,11 @@ export function wardrobeImportApi(options = {}) {
             if (error.code === "ENOENT") throw new Error(`Model reference not found at ${modelPath}. Set WARDROBE_MODEL_REFERENCE or WARDROBE_MODEL_REFERENCE_URL.`);
             throw error;
           }
-          const model = { data: modelData, mime: "image/png", name: "model.png" };
-          const basePrompt = options.modeledPrompt || "Create a professional horizontal 3:2 editorial fashion photograph of the person in Image 1 wearing the exact garment from Image 2. Preserve the person's recognizable identity, face, hair, age and proportions. Preserve every garment color, material, fit, construction, graphic, logo and distinctive detail. Keep the complete featured item clearly visible and unobstructed, use understated neutral supporting clothes, realistic anatomy, natural light, authentic fabric, a tasteful real-world setting, and leave environmental space around the model. No text, watermark, product mockup, or synthetic appearance.";
-          bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_MODELED_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1536x1024", images: [model, garment], prompt: current.stages.modeled.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.modeled.prompt}` : basePrompt });
+          const models = [{ data: modelData, mime: "image/png", name: "model.png" }, ...await loadExtraReferences()];
+          const people = models.length === 1 ? "the person in Image 1" : `the person shown in Images 1-${models.length} (all photos of the same person)`;
+          const likenessOnly = models.length === 1 ? "" : ` Use Images 1-${models.length} only for the person's likeness and build; ignore the clothes, lighting and backgrounds in them.`;
+          const basePrompt = options.modeledPrompt || `Create a professional horizontal 3:2 editorial fashion photograph of ${people} wearing the exact garment from Image ${models.length + 1}.${likenessOnly} Preserve the person's recognizable identity, face, hair, age and proportions. Preserve every garment color, material, fit, construction, graphic, logo and distinctive detail. Keep the complete featured item clearly visible and unobstructed, use understated neutral supporting clothes, realistic anatomy, natural light, authentic fabric, a tasteful real-world setting, and leave environmental space around the model. No text, watermark, product mockup, or synthetic appearance.`;
+          bytes = await openAIEdit({ key, baseUrl: apiBaseUrl(), model: setting("OPENAI_MODELED_MODEL", setting("OPENAI_IMAGE_MODEL", "gpt-image-2")), quality: setting("OPENAI_IMAGE_QUALITY", "high"), size: "1536x1024", images: [...models, garment], prompt: current.stages.modeled.prompt ? `${basePrompt}\nUser regeneration direction: ${current.stages.modeled.prompt}` : basePrompt });
         }
         await writeFile(output, bytes);
         const fresh = await loadJob(current.id);
