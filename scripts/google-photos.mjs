@@ -8,7 +8,8 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const PICKER_API = "https://photospicker.googleapis.com/v1";
 const SCOPE = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly";
 const STATE_TTL_MS = 10 * 60 * 1000;
-export const GOOGLE_PHOTOS_MAX_ITEMS = 20;
+// The Picker API allows at most 2000 items in one session.
+export const GOOGLE_PHOTOS_MAX_ITEMS = 2000;
 const ALBUM_HOSTS = new Set(["photos.app.goo.gl", "goo.gl", "photos.google.com"]);
 const ALBUM_PHOTO_URL = /\["(https:\/\/lh3\.googleusercontent\.com\/pw\/[\w-]+)"/g;
 

@@ -3,10 +3,12 @@ import { copyFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 
 import path from "node:path";
 import sharp from "sharp";
 import { GOOGLE_PHOTOS_MAX_ITEMS, createGooglePhotosClient, downloadSharedAlbumPhoto, fetchSharedAlbum } from "./google-photos.mjs";
+import { createBatchManager } from "./import-batches.mjs";
 
 const API_ROOT = "/api/import/jobs";
 const MAX_EXTRA_REFERENCES = 4;
 const GOOGLE_ROOT = "/api/import/google-photos";
+const BATCH_ROOT = "/api/import/batches";
 const ASSET_ROOT = "/api/import/assets";
 const LIBRARY_ASSET_ROOT = "/api/import/library";
 const STAGES = new Set(["crop", "garment", "modeled"]);
@@ -45,19 +47,6 @@ function googleCallbackPage(ok, message) {
   const payload = JSON.stringify({ type: "wardrobe:google-photos", ok, message }).replace(/</g, "\\u003c");
   const text = message.replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char]);
   return `<!doctype html><meta charset="utf-8"><title>Google Photos</title><body style="font:15px system-ui;padding:32px"><p>${text}</p><script>window.opener?.postMessage(${payload}, location.origin);</script></body>`;
-}
-
-async function mapLimit(values, limit, task) {
-  const results = new Array(values.length);
-  let next = 0;
-  const worker = async () => {
-    while (next < values.length) {
-      const index = next++;
-      results[index] = await task(values[index], index);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
-  return results;
 }
 
 function publicJob(job) {
@@ -367,7 +356,7 @@ async function visionImage(bytes, maxSize = 2048) {
   return `data:image/jpeg;base64,${data.toString("base64")}`;
 }
 
-async function openAIStructured({ key, baseUrl, model, text, images, name, schema }) {
+async function openAIStructured({ key, baseUrl, model, text, images, name, schema, detail = "high" }) {
   const response = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
@@ -375,7 +364,7 @@ async function openAIStructured({ key, baseUrl, model, text, images, name, schem
       model,
       input: [{ role: "user", content: [
         { type: "input_text", text },
-        ...images.map((imageUrl) => ({ type: "input_image", image_url: imageUrl, detail: "high" })),
+        ...images.map((imageUrl) => ({ type: "input_image", image_url: imageUrl, detail })),
       ] }],
       text: { format: { type: "json_schema", name, strict: true, schema } },
     }),
@@ -407,6 +396,17 @@ export async function buildOwnedSheet(files) {
   const rows = Math.ceil(files.length / SHEET_COLUMNS);
   const sheet = await sharp({ create: { width: Math.min(files.length, SHEET_COLUMNS) * SHEET_TILE, height: rows * SHEET_TILE, channels: 3, background: "#ffffff" } }).composite(tiles.flat()).jpeg({ quality: 85 }).toBuffer();
   return `data:image/jpeg;base64,${sheet.toString("base64")}`;
+}
+
+// The cheap first look for big imports: small, low-detail images and a yes/no answer.
+async function openAIQuickCheck({ key, baseUrl, model, image, ownerImage }) {
+  const result = await openAIStructured({
+    key, baseUrl, model, name: "photo_check", detail: "low",
+    images: ownerImage ? [ownerImage, await visionImage(image, 512)] : [await visionImage(image, 512)],
+    text: `${ownerImage ? "Image 1 shows the wardrobe owner. " : ""}Decide if the last image is worth checking for clothes to add to the owner's wardrobe. Set worthChecking to true only if ${ownerImage ? "the owner is in it and at least one garment, pair of shoes or accessory they wear is clearly visible (more than just the face)" : "a person's outfit is clearly visible"}, or if it shows clothes that nobody wears, such as a flat lay, a hanger or a product photo. Set it to false for landscapes, food, screenshots, documents, pets, and photos of other people only.`,
+    schema: { type: "object", additionalProperties: false, properties: { worthChecking: { type: "boolean" } }, required: ["worthChecking"] },
+  });
+  return Boolean(result.worthChecking);
 }
 
 async function openAIAnalyze({ key, baseUrl, model, image, ownerImage, owned = [], ownedSheet = null }) {
@@ -527,9 +527,7 @@ export function wardrobeImportApi(options = {}) {
     const normalizedImage = await normalizeImage(imageBytes);
     const key = setting("OPENAI_API_KEY");
     const model = setting("OPENAI_VISION_MODEL", "gpt-5.4-mini");
-    let ownerImage = null;
-    try { ownerImage = await visionImage(await readFile(modelReferencePath()), 1024); }
-    catch (error) { if (error.code !== "ENOENT") console.warn(`[wardrobe] Could not read the model reference photo: ${error.message}`); }
+    const ownerImage = await ownerVisionImage(1024);
     const owned = await ownedItems();
     let ownedSheet = null;
     try { if (owned.length) ownedSheet = await buildOwnedSheet(owned.map((item) => item.file)); }
@@ -581,33 +579,42 @@ export function wardrobeImportApi(options = {}) {
     return all.filter((_, index) => present[index]).slice(0, SHEET_MAX_ITEMS);
   }
 
-  async function importDownloadedPhotos(photos, download) {
-    // One photo at a time, so each photo is checked against the items the photos before it added.
-    const results = await mapLimit(photos, 1, async (photo) => {
-      try {
-        return { filename: photo.filename, ...(await createJobsFromImage(await download(photo))) };
-      } catch (error) {
-        return { filename: photo.filename, jobs: [], skipped: [], error: error.message };
-      }
-    });
-    return {
-      jobs: results.flatMap((result) => result.jobs),
-      skipped: results.flatMap((result) => result.skipped),
-      photos: results.map(({ filename, jobs, error }) => ({ filename, items: jobs.length, error: error || null })),
-    };
+  async function ownerVisionImage(size) {
+    try { return await visionImage(await readFile(modelReferencePath()), size); }
+    catch (error) {
+      if (error.code !== "ENOENT") console.warn(`[wardrobe] Could not read the model reference photo: ${error.message}`);
+      return null;
+    }
+  }
+
+  const batchManager = createBatchManager({
+    dir: () => path.join(dataDir, "batches"),
+    download: (source, photo) => source.type === "picker" ? googlePhotos.downloadPhoto({ mediaFile: { baseUrl: photo.url } }) : downloadSharedAlbumPhoto(photo.url),
+    checkPhoto: async (bytes) => openAIQuickCheck({ key: setting("OPENAI_API_KEY"), baseUrl: apiBaseUrl(), model: setting("OPENAI_CHECK_MODEL", setting("OPENAI_VISION_MODEL", "gpt-5.4-mini")), image: bytes, ownerImage: await ownerVisionImage(512) }),
+    importPhoto: (bytes) => createJobsFromImage(bytes),
+    afterDownload: async (source) => { if (source.type === "picker" && source.sessionId) await googlePhotos.deleteSession(source.sessionId); },
+  });
+  const batchLimit = () => Math.max(1, Number.parseInt(setting("WARDROBE_BATCH_MAX_PHOTOS", "5000"), 10) || 5000);
+
+  async function batchHandler(req, res, url) {
+    if (url.pathname === BATCH_ROOT && req.method === "GET") return json(res, 200, batchManager.list());
+    if (url.pathname === BATCH_ROOT && req.method === "POST") {
+      await requireReady();
+      const input = await body(req, 16 * 1024);
+      const limit = Math.min(batchLimit(), Math.max(1, Number.parseInt(input.limit, 10) || batchLimit()));
+      const album = await fetchSharedAlbum(input.url);
+      const photos = album.photoUrls.slice(0, limit).map((photoUrl) => ({ url: photoUrl }));
+      return json(res, 202, await batchManager.create({ title: album.title || "Shared album", source: { type: "album", url: String(input.url) }, photos, found: album.photoUrls.length }));
+    }
+    const match = url.pathname.match(/^\/api\/import\/batches\/([a-f0-9-]{36})(?:\/(pause|resume|cancel))?$/i);
+    if (match && match[2] && req.method === "POST") return json(res, 200, await batchManager.control(match[1], match[2]));
+    if (match && !match[2] && req.method === "DELETE") return json(res, 200, await batchManager.control(match[1], "dismiss"));
+    return json(res, 404, { error: "Not found" });
   }
 
   async function googlePhotosHandler(req, res, url) {
     if (url.pathname === `${GOOGLE_ROOT}/status` && req.method === "GET") {
       return json(res, 200, { configured: googlePhotos.configured(), connected: await googlePhotos.connected(), maxItems: GOOGLE_PHOTOS_MAX_ITEMS });
-    }
-    if (url.pathname === `${GOOGLE_ROOT}/album` && req.method === "POST") {
-      await requireReady();
-      const input = await body(req, 16 * 1024);
-      const album = await fetchSharedAlbum(input.url);
-      const photos = album.photoUrls.slice(0, GOOGLE_PHOTOS_MAX_ITEMS).map((photoUrl, index) => ({ photoUrl, filename: `${album.title || "Album"} photo ${index + 1}` }));
-      const result = await importDownloadedPhotos(photos, (photo) => downloadSharedAlbumPhoto(photo.photoUrl));
-      return json(res, 202, { ...result, title: album.title, found: album.photoUrls.length, limit: GOOGLE_PHOTOS_MAX_ITEMS });
     }
     if (!googlePhotos.configured()) throw Object.assign(new Error("Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to .env, then restart the app."), { status: 503 });
     if (url.pathname === `${GOOGLE_ROOT}/connect` && req.method === "GET") {
@@ -645,13 +652,13 @@ export function wardrobeImportApi(options = {}) {
       const session = await googlePhotos.getSession(sessionId);
       if (!session.mediaItemsSet) throw Object.assign(new Error("Pick photos in Google Photos first."), { status: 409 });
       const items = await googlePhotos.listMediaItems(sessionId);
-      const photos = items.filter((item) => item.type !== "VIDEO").slice(0, GOOGLE_PHOTOS_MAX_ITEMS);
-      const result = await importDownloadedPhotos(
-        photos.map((item) => ({ item, filename: item.mediaFile?.filename || "Google Photos image" })),
-        (photo) => googlePhotos.downloadPhoto(photo.item),
-      );
-      await googlePhotos.deleteSession(sessionId);
-      return json(res, 202, { ...result, skippedVideos: items.length - photos.length });
+      const photos = items.filter((item) => item.type !== "VIDEO" && item.mediaFile?.baseUrl).map((item) => ({ url: item.mediaFile.baseUrl, filename: item.mediaFile.filename || null }));
+      if (!photos.length) {
+        await googlePhotos.deleteSession(sessionId);
+        throw Object.assign(new Error("You picked only videos. Pick photos to import."), { status: 422 });
+      }
+      // The session stays open until the photos are downloaded, then the batch closes it.
+      return json(res, 202, await batchManager.create({ title: `${photos.length} Google Photos`, source: { type: "picker", sessionId }, photos }));
     }
     return json(res, 404, { error: "Not found" });
   }
@@ -831,6 +838,7 @@ export function wardrobeImportApi(options = {}) {
         return json(res, 200, await loadImported());
       }
       if (url.pathname.startsWith(`${GOOGLE_ROOT}/`)) return await googlePhotosHandler(req, res, url);
+      if (url.pathname === BATCH_ROOT || url.pathname.startsWith(`${BATCH_ROOT}/`)) return await batchHandler(req, res, url);
       if (url.pathname === "/api/import/config" && req.method === "GET") {
         return json(res, 200, await setupStatus());
       }
@@ -1000,6 +1008,7 @@ export function wardrobeImportApi(options = {}) {
       await mkdir(jobsDir, { recursive: true });
       await mkdir(libraryAssetDir, { recursive: true });
       await downloadModelReference();
+      await batchManager.load();
       const ids = await readdir(jobsDir).catch(() => []);
       for (const id of ids) {
         const job = await loadJob(id);

@@ -195,6 +195,14 @@
 .import-status.is-complete { color: #49604b; }
 .import-status.is-error { color: #8a3f35; }
 .import-status + .import-status { margin-top: 8px; }
+.import-batch-list { display: grid; gap: 10px; margin-bottom: 18px; }
+.import-batch { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--import-line); border-radius: 16px; background: rgba(255, 253, 247, 0.7); }
+.import-batch__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.import-batch__head .import-card__detail { margin-top: 4px; }
+.import-batch__error { color: #8a3f35; }
+.import-batch__track { height: 4px; overflow: hidden; border-radius: 999px; background: var(--import-line); }
+.import-batch__bar { height: 100%; border-radius: inherit; background: var(--import-ink); transition: width 400ms var(--import-ease); }
+.import-batch.is-paused .import-batch__bar { opacity: 0.4; }
 .import-shortcuts { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 18px 0 0; color: var(--import-muted); font-size: 11px; }
 .import-shortcuts span { display: inline-flex; align-items: center; gap: 4px; }
 .import-popover kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 4px; border: 1px solid var(--import-line); border-bottom-width: 2px; border-radius: 5px; font: 500 10px/1 "Instrument Sans", sans-serif; color: inherit; opacity: 0.75; }
